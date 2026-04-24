@@ -53,6 +53,12 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     private var peripheral: CBPeripheral?
     private var rxCharacteristic: CBCharacteristic?
     private var txCharacteristic: CBCharacteristic?
+    /// Cached preferred write type for the RX characteristic, derived from
+    /// `rxCharacteristic.properties` after discovery. The stock RNode firmware
+    /// (markqvist/RNode_Firmware/BLESerial.cpp:153) exposes RX with
+    /// `PROPERTY_WRITE` only, so iOS will refuse `.withoutResponse` writes and
+    /// silently drop the data. We pick the write type at discovery time.
+    private var rxWriteType: CBCharacteristicWriteType = .withResponse
     private var shouldReconnect = true
     private let bleQueue: DispatchQueue
 
@@ -108,25 +114,38 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
 
     /// Write data to the RX characteristic (to the RNode device).
     ///
-    /// Chunks data to fit within BLE MTU. Uses .withoutResponse for throughput.
+    /// Chunks data to fit within BLE MTU. Write type is chosen at discovery
+    /// time based on the characteristic's declared `properties`: prefers
+    /// `.withoutResponse` for throughput when supported, falls back to
+    /// `.withResponse` (with the corresponding lower MTU) when only the
+    /// `write` bit is set — which is the case on stock RNode firmware
+    /// (BLESerial.cpp:153, `BLECharacteristic::PROPERTY_WRITE` only).
+    /// Querying `maximumWriteValueLength(for:)` with the actually-used type
+    /// is required: it returns different sizes per type (typically 185 for
+    /// `.withoutResponse` and 512 for `.withResponse` after MTU exchange).
     func writeToDevice(_ data: Data) {
         guard let peripheral = peripheral, let rxChar = rxCharacteristic else { return }
 
-        let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        let mtu = peripheral.maximumWriteValueLength(for: rxWriteType)
         guard mtu > 0 else { return }
 
         var offset = 0
         while offset < data.count {
             let chunkEnd = min(offset + mtu, data.count)
             let chunk = data[offset..<chunkEnd]
-            peripheral.writeValue(Data(chunk), for: rxChar, type: .withoutResponse)
+            peripheral.writeValue(Data(chunk), for: rxChar, type: rxWriteType)
             offset = chunkEnd
         }
     }
 
-    /// Get the current BLE MTU for write-without-response.
+    /// Get the current BLE MTU for the chosen write type.
     var currentMTU: Int {
-        peripheral?.maximumWriteValueLength(for: .withoutResponse) ?? 20
+        peripheral?.maximumWriteValueLength(for: rxWriteType) ?? 20
+    }
+
+    /// Whether a peripheral is currently connected (CB state == .connected).
+    var isConnected: Bool {
+        peripheral?.state == .connected
     }
 
     // MARK: - CBCentralManagerDelegate
@@ -168,6 +187,8 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     ) {
         rxCharacteristic = nil
         txCharacteristic = nil
+        // Reset write-type to a safe default for the next discovery cycle.
+        rxWriteType = .withResponse
         connectionHandler?(false)
 
         // Auto-reconnect if desired
@@ -218,6 +239,14 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         for char in characteristics {
             if char.uuid == nusRXCharCBUUID {
                 rxCharacteristic = char
+                // Choose write type from declared properties. Stock RNode
+                // firmware exposes only `.write` (with response); other
+                // forks may expose `.writeWithoutResponse` for throughput.
+                if char.properties.contains(.writeWithoutResponse) {
+                    rxWriteType = .withoutResponse
+                } else {
+                    rxWriteType = .withResponse
+                }
             } else if char.uuid == nusTXCharCBUUID {
                 txCharacteristic = char
                 // Subscribe to TX notifications for incoming data from RNode
@@ -228,6 +257,22 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         // If both characteristics found, signal connected
         if rxCharacteristic != nil && txCharacteristic != nil {
             connectionHandler?(true)
+        }
+    }
+
+    /// Called when a `.withResponse` write completes (or fails). On stock
+    /// RNode firmware the very first write to RX triggers iOS pairing; the
+    /// callback fires with `error == nil` once pairing succeeds and the
+    /// data has been delivered, or with a CBATT error if the user denied
+    /// pairing or the link dropped first. We surface the error to the
+    /// actor so it can decide whether to retry / disconnect.
+    func peripheral(
+        _ peripheral: CBPeripheral,
+        didWriteValueFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        if let error = error {
+            errorHandler?(error)
         }
     }
 
@@ -281,6 +326,17 @@ public actor RNodeInterface: NetworkInterface {
     private var radioConfig: RNodeConstants.RadioConfig
     private var isDetected = false
     private var shouldReconnect = false
+    /// Detection wait, resumed either by `handleBLEData` on DETECT_RESP or by
+    /// `onDisconnected` when the link drops. Replaces a 100ms polling loop
+    /// that previously continued running after disconnect, producing
+    /// misleading "no DETECT_RESP within 3 seconds" log lines.
+    private var detectContinuation: CheckedContinuation<Bool, Never>?
+    /// Detection timeout. Stock RNode firmware requires an MITM-paired link
+    /// before TX writes are unblocked (BLESerial.cpp:78), and pairing
+    /// requires user interaction with the iOS pairing dialog. The Python
+    /// upstream uses 5s; we use 20s to give the user realistic time to tap
+    /// "Pair" without the connection being torn down out from under them.
+    private static let detectTimeoutSeconds: UInt64 = 20
     private let logger = Logger(label: "ReticulumKit.RNodeInterface")
 
     // MARK: - Init
@@ -398,6 +454,12 @@ public actor RNodeInterface: NetworkInterface {
                 if frame.payload.first == RNodeConstants.DETECT_RESP {
                     isDetected = true
                     logger.info("RNode detected (DETECT_RESP received)")
+                    // Wake the detection wait immediately rather than
+                    // letting it run out the full timeout.
+                    if let continuation = detectContinuation {
+                        detectContinuation = nil
+                        continuation.resume(returning: true)
+                    }
                 }
 
             case RNodeConstants.CMD_STAT_RSSI:
@@ -447,26 +509,60 @@ public actor RNodeInterface: NetworkInterface {
 
     /// Called when BLE connection is established and NUS characteristics discovered.
     /// Runs the detection sequence before radio initialization.
+    ///
+    /// On stock RNode firmware the very first write to the RX characteristic
+    /// (DETECT_REQ) triggers an iOS pairing prompt because the firmware
+    /// declares `ESP_GATT_PERM_WRITE_ENC_MITM`. The user must confirm the
+    /// pairing dialog before the firmware will accept the write or send any
+    /// notifications back. We therefore wait up to 20s — well beyond
+    /// realistic user reaction time — and rely on a CheckedContinuation
+    /// resumed either by an incoming DETECT_RESP or by `onDisconnected`
+    /// when the link drops. We do NOT manually call `disconnectPeripheral`
+    /// on timeout — that would dismiss any pending pairing dialog and
+    /// guarantee failure.
     private func onConnected() async {
         logger.info("RNode BLE connected, running detection sequence")
         isDetected = false
         deframer = KISSDeframer()
 
-        // Send detection request
+        // Cancel any stale detection wait from a previous connection cycle.
+        if let stale = detectContinuation {
+            detectContinuation = nil
+            stale.resume(returning: false)
+        }
+
+        // Send detection request. On first connect this triggers iOS pairing.
         bleDelegate.writeToDevice(RNodeConstants.detectRequest)
 
-        // Wait up to 3 seconds for detection response
-        let deadline = Date().addingTimeInterval(3.0)
-        while !isDetected && Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
+        // Wait for DETECT_RESP, link drop, or timeout — whichever first.
+        let detected = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            self.detectContinuation = continuation
+            // Timeout watchdog. If the continuation is still pending when
+            // the timeout fires, resume it with `false`.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: Self.detectTimeoutSeconds * 1_000_000_000)
+                await self?.timeoutDetection()
+            }
         }
 
-        if isDetected {
+        if detected {
             await initRadio()
         } else {
-            logger.error("RNode detection failed -- no DETECT_RESP within 3 seconds")
-            bleDelegate.disconnectPeripheral()
+            logger.error("RNode detection failed -- no DETECT_RESP within \(Self.detectTimeoutSeconds) seconds")
+            // Tear down the link only after a real timeout (not a spurious
+            // disconnect — `onDisconnected` already handled that path).
+            if bleDelegate.isConnected {
+                bleDelegate.disconnectPeripheral()
+            }
         }
+    }
+
+    /// Resume the detection wait with `false` if it is still pending. Called
+    /// from the timeout watchdog Task. Idempotent.
+    private func timeoutDetection() {
+        guard let continuation = detectContinuation else { return }
+        detectContinuation = nil
+        continuation.resume(returning: false)
     }
 
     /// Configure radio parameters and enable radio.
@@ -491,6 +587,14 @@ public actor RNodeInterface: NetworkInterface {
         _isOnline = false
         isDetected = false
         logger.info("RNode BLE disconnected")
+
+        // If a detection wait is in flight, resume it immediately with
+        // `false` so we don't keep logging stale "no DETECT_RESP" errors
+        // after the link is already gone.
+        if let continuation = detectContinuation {
+            detectContinuation = nil
+            continuation.resume(returning: false)
+        }
 
         if shouldReconnect {
             logger.info("Will attempt reconnection in 2 seconds")
