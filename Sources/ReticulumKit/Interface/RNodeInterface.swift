@@ -61,6 +61,13 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
     private var rxWriteType: CBCharacteristicWriteType = .withResponse
     private var shouldReconnect = true
     private let bleQueue: DispatchQueue
+    /// Current reconnect backoff in seconds. Doubles on each failed attempt
+    /// up to a cap, resets on successful connection. See `scheduleReconnect()`.
+    private var reconnectBackoffSeconds: Double = 2.0
+    private static let maxReconnectBackoffSeconds: Double = 30.0
+    /// Logger for delegate-side events (CBError codes etc.) so the actor and
+    /// the delegate share a logging surface.
+    private let logger = Logger(label: "ReticulumKit.RNodeBLEDelegate")
 
     /// NUS service UUID for scanning
     private let nusServiceCBUUID = CBUUID(string: RNodeConstants.nusServiceUUID)
@@ -177,7 +184,9 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
+        logBLEError(error, context: "didFailToConnect")
         connectionHandler?(false)
+        if shouldReconnect { scheduleReconnect() }
     }
 
     func centralManager(
@@ -185,18 +194,57 @@ final class RNodeBLEDelegate: NSObject, CBCentralManagerDelegate, CBPeripheralDe
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        logBLEError(error, context: "didDisconnectPeripheral")
         rxCharacteristic = nil
         txCharacteristic = nil
         // Reset write-type to a safe default for the next discovery cycle.
         rxWriteType = .withResponse
         connectionHandler?(false)
 
-        // Auto-reconnect if desired
-        if shouldReconnect {
-            bleQueue.asyncAfter(deadline: .now() + 2.0) { @Sendable [weak self] in
-                self?.startScanning()
-            }
+        // Auto-reconnect if desired, with exponential backoff.
+        if shouldReconnect { scheduleReconnect() }
+    }
+
+    /// Log a CBError (or any Error) from a CoreBluetooth delegate callback.
+    /// Includes the CBError.Code raw value, domain, and localized description
+    /// so we can finally see whether iOS reports `pairingNotAllowed`,
+    /// `peerRemovedPairingInformation`, `connectionTimeout`, etc.
+    private func logBLEError(_ error: Error?, context: String) {
+        guard let error = error else { return }
+        let nsError = error as NSError
+        if let cbCode = CBError.Code(rawValue: nsError.code) {
+            logger.error(
+                "BLE \(context) error: CBError code \(nsError.code) (\(String(describing: cbCode))), domain=\(nsError.domain), description=\(error.localizedDescription)"
+            )
+        } else {
+            logger.error(
+                "BLE \(context) error: code \(nsError.code), domain=\(nsError.domain), description=\(error.localizedDescription)"
+            )
         }
+        errorHandler?(error)
+    }
+
+    /// Schedule a reconnect attempt with the current backoff, then double the
+    /// backoff for the next failure (capped). `onConnected` resets the backoff
+    /// to the initial value on a successful link establishment.
+    private func scheduleReconnect() {
+        let delay = reconnectBackoffSeconds
+        // Pre-double for the next failure.
+        reconnectBackoffSeconds = min(reconnectBackoffSeconds * 2.0, Self.maxReconnectBackoffSeconds)
+        if delay >= Self.maxReconnectBackoffSeconds {
+            logger.warning("RNode reconnect throttled — too many rapid failures, backing off \(delay)s")
+        } else {
+            logger.info("Will attempt reconnection in \(Int(delay)) seconds")
+        }
+        bleQueue.asyncAfter(deadline: .now() + delay) { @Sendable [weak self] in
+            self?.startScanning()
+        }
+    }
+
+    /// Reset reconnect backoff after a successful establishment of the link.
+    /// Called by the actor on every fresh `onConnected`.
+    func resetReconnectBackoff() {
+        reconnectBackoffSeconds = 2.0
     }
 
     /// State preservation/restoration for background BLE (IFACE-04).
@@ -326,11 +374,24 @@ public actor RNodeInterface: NetworkInterface {
     private var radioConfig: RNodeConstants.RadioConfig
     private var isDetected = false
     private var shouldReconnect = false
-    /// Detection wait, resumed either by `handleBLEData` on DETECT_RESP or by
-    /// `onDisconnected` when the link drops. Replaces a 100ms polling loop
-    /// that previously continued running after disconnect, producing
-    /// misleading "no DETECT_RESP within 3 seconds" log lines.
-    private var detectContinuation: CheckedContinuation<Bool, Never>?
+    /// How the detection wait was resumed. Used to produce accurate log
+    /// messages — previously every resume path reported "no DETECT_RESP
+    /// within 20 seconds" which is misleading when the link dropped early.
+    private enum DetectionOutcome {
+        case detected           // DETECT_RESP received
+        case linkDropped        // peripheral disconnected before DETECT_RESP
+        case timedOut           // 20s watchdog elapsed while still connected
+        case staleCancelled     // cancelled by a fresh connect cycle
+    }
+    /// Detection wait, resumed by `handleBLEData` on DETECT_RESP, by
+    /// `onDisconnected` when the link drops, by the timeout watchdog, or
+    /// by a stale-continuation cancellation in a fresh connect cycle.
+    private var detectContinuation: CheckedContinuation<DetectionOutcome, Never>?
+    /// Timestamp of the most recent BLE connect, used by `onDisconnected` to
+    /// distinguish "dropped almost immediately" (likely pairing rejection by
+    /// firmware) from a longer-lived link. Drives the "hold the button"
+    /// hint heuristic.
+    private var lastConnectAt: Date?
     /// Detection timeout. Stock RNode firmware requires an MITM-paired link
     /// before TX writes are unblocked (BLESerial.cpp:78), and pairing
     /// requires user interaction with the iOS pairing dialog. The Python
@@ -458,7 +519,7 @@ public actor RNodeInterface: NetworkInterface {
                     // letting it run out the full timeout.
                     if let continuation = detectContinuation {
                         detectContinuation = nil
-                        continuation.resume(returning: true)
+                        continuation.resume(returning: .detected)
                     }
                 }
 
@@ -524,45 +585,58 @@ public actor RNodeInterface: NetworkInterface {
         logger.info("RNode BLE connected, running detection sequence")
         isDetected = false
         deframer = KISSDeframer()
+        lastConnectAt = Date()
+
+        // A successful link establishment resets the reconnect backoff so the
+        // next failure starts at the short delay again.
+        bleDelegate.resetReconnectBackoff()
 
         // Cancel any stale detection wait from a previous connection cycle.
         if let stale = detectContinuation {
             detectContinuation = nil
-            stale.resume(returning: false)
+            stale.resume(returning: .staleCancelled)
         }
 
         // Send detection request. On first connect this triggers iOS pairing.
         bleDelegate.writeToDevice(RNodeConstants.detectRequest)
 
         // Wait for DETECT_RESP, link drop, or timeout — whichever first.
-        let detected = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        let outcome = await withCheckedContinuation { (continuation: CheckedContinuation<DetectionOutcome, Never>) in
             self.detectContinuation = continuation
             // Timeout watchdog. If the continuation is still pending when
-            // the timeout fires, resume it with `false`.
+            // the timeout fires, resume it with `.timedOut`.
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: Self.detectTimeoutSeconds * 1_000_000_000)
                 await self?.timeoutDetection()
             }
         }
 
-        if detected {
+        switch outcome {
+        case .detected:
             await initRadio()
-        } else {
-            logger.error("RNode detection failed -- no DETECT_RESP within \(Self.detectTimeoutSeconds) seconds")
-            // Tear down the link only after a real timeout (not a spurious
-            // disconnect — `onDisconnected` already handled that path).
+        case .linkDropped:
+            // No-op for logging here — `onDisconnected` already logged the
+            // disconnect (and the pairing-mode hint if appropriate).
+            break
+        case .timedOut:
+            logger.error("RNode detection timed out after \(Self.detectTimeoutSeconds)s while connected (DETECT_RESP never arrived)")
+            // Tear down the link only after a real watchdog timeout. The
+            // disconnect-resume path is handled by `onDisconnected` directly.
             if bleDelegate.isConnected {
                 bleDelegate.disconnectPeripheral()
             }
+        case .staleCancelled:
+            // Superseded by a fresh connect cycle — nothing to log.
+            break
         }
     }
 
-    /// Resume the detection wait with `false` if it is still pending. Called
-    /// from the timeout watchdog Task. Idempotent.
+    /// Resume the detection wait with `.timedOut` if it is still pending.
+    /// Called from the timeout watchdog Task. Idempotent.
     private func timeoutDetection() {
         guard let continuation = detectContinuation else { return }
         detectContinuation = nil
-        continuation.resume(returning: false)
+        continuation.resume(returning: .timedOut)
     }
 
     /// Configure radio parameters and enable radio.
@@ -583,22 +657,47 @@ public actor RNodeInterface: NetworkInterface {
     }
 
     /// Called when BLE connection is lost.
+    ///
+    /// In addition to resuming the detection wait, this is where we apply
+    /// the "pairing-mode hint" heuristic: if the link dropped within ~3s of
+    /// being established and we never received DETECT_RESP, the most likely
+    /// explanation is that the stock RNode firmware rejected the BLE
+    /// security request because `bt_allow_pairing == false`. The user must
+    /// hold the user button on the RNode hardware for 5-10 seconds to enter
+    /// pairing mode (RNode_Firmware.ino:1822, `bt_enable_pairing()` →
+    /// `bt_state = BT_STATE_PAIRING`). Surfacing this as an actionable log
+    /// line is the single most user-visible improvement we can make.
     private func onDisconnected() {
         _isOnline = false
+        let wasWaitingForDetect = (detectContinuation != nil) && !isDetected
+        let connectionAge: TimeInterval? = lastConnectAt.map { Date().timeIntervalSince($0) }
         isDetected = false
         logger.info("RNode BLE disconnected")
 
-        // If a detection wait is in flight, resume it immediately with
-        // `false` so we don't keep logging stale "no DETECT_RESP" errors
-        // after the link is already gone.
+        // If a detection wait is in flight, resume it with `.linkDropped` so
+        // `onConnected` can take the disconnect-aware path and produce the
+        // accurate log message there (or none, since we log here).
         if let continuation = detectContinuation {
             detectContinuation = nil
-            continuation.resume(returning: false)
+            continuation.resume(returning: .linkDropped)
         }
 
-        if shouldReconnect {
-            logger.info("Will attempt reconnection in 2 seconds")
-            // Reconnect scan is handled by the delegate's didDisconnect handler
+        // Pairing-mode hint heuristic: link dropped before DETECT_RESP and
+        // dropped quickly. The "<= 3s" threshold is chosen to catch the
+        // observed "connect and disconnect on the same second" pattern from
+        // the firmware-side security_request rejection without false-firing
+        // on legitimate transient drops on a working link (which take longer).
+        if wasWaitingForDetect, let age = connectionAge, age <= 3.0 {
+            logger.error(
+                "RNode link dropped before pairing completed (link held \(String(format: "%.1f", age))s, no DETECT_RESP). The device likely requires pairing mode — on the RNode hardware, hold the user button for 5-10 seconds to enable pairing, then retry."
+            )
+        } else if wasWaitingForDetect {
+            logger.warning("RNode disconnected before completing detection (DETECT_RESP never arrived)")
         }
+
+        lastConnectAt = nil
+
+        // Reconnect scheduling is handled by the delegate's didDisconnect /
+        // didFailToConnect handlers via `scheduleReconnect()` (with backoff).
     }
 }
