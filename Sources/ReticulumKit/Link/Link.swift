@@ -254,6 +254,55 @@ public actor Link {
 
     // MARK: - Process Proof (Initiator)
 
+    /// Process the link proof from the responder, skipping the Ed25519 signature
+    /// verification step.
+    ///
+    /// **Use only when no announce is in the routing table for the destination.**
+    /// Without the peer's announce we don't have their long-term Ed25519 signing
+    /// key to verify the proof signature, so we can only do the ECDH portion of
+    /// the handshake. The link tunnel still provides confidentiality (the Token
+    /// is derived from a fresh ECDH each link), but loses peer-identity
+    /// authentication — a MITM that intercepted the link request could impersonate
+    /// the responder. A subsequent announce should re-establish full trust.
+    public func processProofWithoutSignatureCheck(
+        rawProofPacket: Data,
+        proofPacket: Packet
+    ) throws {
+        guard status == .pending else {
+            throw ReticulumError.linkInvalidState("processProofWithoutSignatureCheck requires .pending, got \(status)")
+        }
+        guard let ephPriv = ephemeralPrivateKey else {
+            throw ReticulumError.linkInvalidState("processProofWithoutSignatureCheck: ephemeral private key missing")
+        }
+        guard proofPacket.data.count >= 96 else {
+            throw ReticulumError.linkInvalidProof("proof data too short: \(proofPacket.data.count)")
+        }
+
+        // ECDH with responder ephemeral X25519
+        let responderX25519PubBytes = Data(proofPacket.data[64..<96])
+        let responderX25519Pub = try Curve25519.KeyAgreement.PublicKey(
+            rawRepresentation: responderX25519PubBytes
+        )
+        let sharedSecret = try CryptoEngine.keyAgreement(
+            privateKey: ephPriv,
+            publicKey: responderX25519Pub
+        )
+        let sharedSecretData = sharedSecret.withUnsafeBytes { Data($0) }
+        let derivedKey = CryptoEngine.hkdf(
+            length: 64,
+            inputKeyMaterial: sharedSecretData,
+            salt: linkId.data,
+            context: nil
+        )
+        self.token = try Token(key: derivedKey)
+
+        self.status = .handshake
+        self.ephemeralPrivateKey = nil
+        if let sentAt = requestSentAt {
+            self.rtt = Date().timeIntervalSince(sentAt)
+        }
+    }
+
     /// Process the link proof from the responder.
     /// Performs ECDH with responder's ephemeral key, derives Token, verifies signature.
     public func processProof(

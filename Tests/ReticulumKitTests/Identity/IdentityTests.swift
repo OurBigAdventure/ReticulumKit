@@ -103,15 +103,65 @@ struct IdentityTests {
 
     // MARK: - Encrypt / Decrypt
 
-    @Test("Identity encrypt/decrypt between two identities round-trips")
+    @Test("Identity encrypt/decrypt between two identities round-trips (RNS-compatible wire format)")
     func encryptDecryptBetweenIdentities() throws {
         let alice = Identity()
         let bob = Identity()
         let plaintext = Data("secret message from Alice to Bob".utf8)
 
-        let ciphertext = try alice.encrypt(plaintext: plaintext, for: bob.agreementPublicKey)
-        let decrypted = try bob.decrypt(ciphertext: ciphertext, from: alice.agreementPublicKey)
+        // Alice encrypts FOR bob (using bob's identity, including hash for HKDF salt).
+        // The ciphertext is [ephemeral_pub:32] + [iv:16] + [ciphertext:var] + [hmac:32].
+        let ciphertext = try alice.encrypt(plaintext: plaintext, for: bob)
+
+        // Wire-format check: ephemeral pubkey prefix is present.
+        #expect(ciphertext.count >= 32 + TokenConstants.overhead)
+
+        // Bob decrypts using only his own private key — no sender public key needed
+        // (the ephemeral pubkey is embedded in the ciphertext, like Python RNS).
+        let decrypted = try bob.decrypt(ciphertext: ciphertext)
         #expect(decrypted == plaintext)
+    }
+
+    @Test("Identity encrypt produces fresh ephemeral key each call (forward secrecy)")
+    func encryptUsesFreshEphemeralKey() throws {
+        let alice = Identity()
+        let bob = Identity()
+        let plaintext = Data("hello".utf8)
+
+        let c1 = try alice.encrypt(plaintext: plaintext, for: bob)
+        let c2 = try alice.encrypt(plaintext: plaintext, for: bob)
+
+        // First 32 bytes are the ephemeral public key — must differ across calls.
+        #expect(c1.prefix(32) != c2.prefix(32))
+
+        // Both must still decrypt back to the same plaintext.
+        #expect(try bob.decrypt(ciphertext: c1) == plaintext)
+        #expect(try bob.decrypt(ciphertext: c2) == plaintext)
+    }
+
+    @Test("Identity decrypt rejects tampered ciphertext via HMAC")
+    func decryptRejectsTamperedCiphertext() throws {
+        let alice = Identity()
+        let bob = Identity()
+        let plaintext = Data("important".utf8)
+
+        var ciphertext = try alice.encrypt(plaintext: plaintext, for: bob)
+        // Flip a byte in the AES ciphertext region (after ephemeral pubkey + IV).
+        let flipIndex = ciphertext.startIndex + 32 + 16 + 1
+        ciphertext[flipIndex] ^= 0xFF
+
+        #expect(throws: (any Error).self) {
+            _ = try bob.decrypt(ciphertext: ciphertext)
+        }
+    }
+
+    @Test("Identity decrypt rejects too-short input")
+    func decryptRejectsTooShortInput() throws {
+        let bob = Identity()
+        let tiny = Data(repeating: 0, count: 32 + TokenConstants.overhead)  // exactly at threshold, must reject (> not >=)
+        #expect(throws: (any Error).self) {
+            _ = try bob.decrypt(ciphertext: tiny)
+        }
     }
 }
 

@@ -41,8 +41,8 @@ public actor Transport {
     /// Background task for periodic re-announce.
     private var reAnnounceTask: Task<Void, Never>?
 
-    /// Background tasks listening to each interface's incoming packet stream.
-    private var interfaceListenerTasks: [Task<Void, Never>] = []
+    /// Background tasks listening to each interface's incoming packet stream, keyed by interfaceId.
+    private var interfaceListenerTasks: [String: Task<Void, Never>] = [:]
 
     /// Destinations this node announces for.
     private var localDestinations: [Destination] = []
@@ -67,6 +67,9 @@ public actor Transport {
 
     /// Callback for single-destination data packets (non-link addressed).
     private var packetDataCallback: (@Sendable (Packet) async -> Void)?
+
+    /// Callback for non-link proof packets (delivery proofs).
+    private var proofCallback: (@Sendable (Packet) async -> Void)?
 
     /// Callbacks for validated incoming announces.
     private var announceCallbacks: [@Sendable (AnnounceResult) async -> Void] = []
@@ -97,7 +100,21 @@ public actor Transport {
                 await self.processIncomingPacket(raw, from: interface)
             }
         }
-        interfaceListenerTasks.append(task)
+        interfaceListenerTasks[interface.interfaceId] = task
+    }
+
+    /// Unregister a network interface by id.
+    ///
+    /// Cancels the interface's packet listener task and removes its rate limiter.
+    /// The caller is responsible for stopping the interface before (or instead of)
+    /// calling this method — `InterfaceManager.remove(interfaceId:)` already does so.
+    ///
+    /// - Parameter id: The `interfaceId` of the interface to remove.
+    public func removeInterface(id: String) async {
+        interfaceListenerTasks[id]?.cancel()
+        interfaceListenerTasks.removeValue(forKey: id)
+        rateLimiters.removeValue(forKey: id)
+        interfaces.removeAll { $0.interfaceId == id }
     }
 
     // MARK: - Destination Registration
@@ -129,6 +146,11 @@ public actor Transport {
     /// Register a callback for non-link single-destination data packets.
     public func onPacketData(_ callback: @escaping @Sendable (Packet) async -> Void) {
         packetDataCallback = callback
+    }
+
+    /// Register a callback for non-link proof packets (delivery proofs).
+    public func onProof(_ callback: @escaping @Sendable (Packet) async -> Void) {
+        proofCallback = callback
     }
 
     /// Register a callback for validated incoming announces.
@@ -190,6 +212,8 @@ public actor Transport {
             return
         }
 
+        logger.info("rx: type=\(packet.header.packetType) ctx=\(packet.context) dstType=\(packet.header.destinationType) dst=\(packet.destinationHash.data.prefix(4).hexEncodedString) bytes=\(raw.count) iface=\(interface.interfaceId)")
+
         switch packet.header.packetType {
         case .announce:
             // Handles both normal announces (context=.none) and pathResponse announces
@@ -201,12 +225,20 @@ public actor Transport {
         case .proof:
             if packet.context == .lrProof {
                 await handleLinkProof(raw, packet: packet, from: interface)
+            } else if let proofCallback {
+                await proofCallback(packet)
             } else {
-                logger.debug("Non-link proof context \(packet.context), skipping")
+                logger.debug("Non-link proof context \(packet.context), no handler registered")
             }
         case .data:
             if packet.header.destinationType == .link {
                 await handleLinkData(packet, from: interface)
+            } else if packet.header.destinationType == .plain
+                && localDestinations.contains(where: { $0.hash == packet.destinationHash }) {
+                // A broadcast `.data .plain` packet addressed to one of our
+                // local destinations — treat as a path request from a peer
+                // looking us up. Reply with our announce in pathResponse ctx.
+                await handleIncomingPathRequest(packet, from: interface)
             } else {
                 if let packetDataCallback {
                     await packetDataCallback(packet)
@@ -214,6 +246,42 @@ public actor Transport {
                     logger.debug("Non-link data packet, skipping (Phase 4+)")
                 }
             }
+        }
+    }
+
+    /// Respond to an incoming path request.
+    ///
+    /// Path requests are broadcast `.data .plain` packets whose header destination
+    /// is the destination being looked up. If the looked-up hash is one of our
+    /// local destinations, reply with our announce in `pathResponse` context so
+    /// the requester learns where to find us. Without this, peers like Sideband /
+    /// Columba spin forever when adding us by hash.
+    private func handleIncomingPathRequest(_ packet: Packet, from interface: any NetworkInterface) async {
+        let targetHash = packet.destinationHash
+        let targetHex = targetHash.data.prefix(4).hexEncodedString
+
+        guard let localDest = localDestinations.first(where: { $0.hash == targetHash }) else {
+            // Should be impossible because the dispatch already checked, but be defensive.
+            logger.debug("path request: dispatch matched but destination missing for \(targetHex)")
+            return
+        }
+
+        do {
+            let appData = localAppData[targetHash]
+            let basePacket = try Announce.create(destination: localDest, appData: appData)
+            // Re-emit with pathResponse context so recipients know this is a reply.
+            let response = Packet(
+                header: basePacket.header,
+                destinationHash: basePacket.destinationHash,
+                transportId: basePacket.transportId,
+                context: .pathResponse,
+                data: basePacket.data
+            )
+            let packedData = try response.pack()
+            try await interface.send(packedData)
+            logger.info("path request: replied for local \(targetHex) on \(interface.interfaceId) (\(packedData.count) bytes)")
+        } catch {
+            logger.warning("path request: failed to build response for \(targetHex): \(error)")
         }
     }
 
@@ -227,9 +295,10 @@ public actor Transport {
     /// - Parameter destinationHash: The destination hash to request a path for.
     /// - Throws: If packet creation or packing fails.
     public func requestPath(to destinationHash: TruncatedHash) async throws {
+        let destHex = destinationHash.data.prefix(4).hexEncodedString
         // Skip if destination already known
         if await routingTable.hasPath(for: destinationHash) {
-            logger.debug("Path already known for \(destinationHash.hexString)")
+            logger.info("requestPath: path already known for \(destHex)")
             return
         }
 
@@ -237,7 +306,7 @@ public actor Transport {
         if let lastRequest = pathRequestTimes[destinationHash] {
             let elapsed = Date().timeIntervalSince(lastRequest)
             if elapsed < LinkConstants.pathRequestMinInterval {
-                logger.debug("Path request rate limited for \(destinationHash.hexString)")
+                logger.warning("requestPath: rate-limited for \(destHex) (last request \(Int(elapsed))s ago)")
                 return
             }
         }
@@ -245,15 +314,18 @@ public actor Transport {
         let packet = try PathRequest.create(targetHash: destinationHash)
         let packedData = try packet.pack()
 
+        var sentOn = 0
         for interface in interfaces {
             let isOnline = await interface.isOnline
             guard isOnline else { continue }
             do {
                 try await interface.send(packedData)
+                sentOn += 1
             } catch {
                 logger.warning("Failed to send path request on \(interface.interfaceId): \(error)")
             }
         }
+        logger.info("requestPath: broadcast for \(destHex) on \(sentOn) interface(s)")
 
         pathRequestTimes[destinationHash] = Date()
     }
@@ -326,17 +398,36 @@ public actor Transport {
         let link = Link.initiator(to: destinationHash, identity: identity)
         let (packet, _) = try await link.createRequest()
         let packedData = try packet.pack()
+        let linkId = await link.linkId
+        let destHex = destinationHash.data.prefix(4).hexEncodedString
+        let linkHex = linkId.data.prefix(4).hexEncodedString
+
+        let routeEntry = await routingTable.lookup(destinationHash)
+        if routeEntry == nil {
+            logger.warning("establishLink: no route for \(destHex) -- link request will be broadcast blindly")
+        } else {
+            logger.debug("establishLink: route known for \(destHex)")
+        }
 
         pendingLinks[destinationHash] = link
 
+        var sentOn = 0
         for interface in interfaces {
             let isOnline = await interface.isOnline
-            guard isOnline else { continue }
+            guard isOnline else {
+                logger.debug("establishLink: skipping offline interface \(interface.interfaceId)")
+                continue
+            }
             do {
                 try await interface.send(packedData)
+                sentOn += 1
+                logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent on \(interface.interfaceId) (\(packedData.count) bytes)")
             } catch {
-                logger.warning("Failed to send link request on \(interface.interfaceId): \(error)")
+                logger.warning("establishLink: failed to send link request on \(interface.interfaceId): \(error)")
             }
+        }
+        if sentOn == 0 {
+            logger.warning("establishLink: link=\(linkHex) -> \(destHex) NO online interface; request not transmitted")
         }
 
         return link
@@ -407,6 +498,8 @@ public actor Transport {
     private func handleLinkProof(_ raw: Data, packet: Packet, from interface: any NetworkInterface) async {
         // The proof packet's destinationHash is the linkId
         let proofLinkId = packet.destinationHash
+        let proofHex = proofLinkId.data.prefix(4).hexEncodedString
+        logger.info("handleLinkProof: received proof for link=\(proofHex) on \(interface.interfaceId) (\(raw.count) bytes)")
 
         // Find the pending link whose linkId matches
         var matchedDestHash: TruncatedHash?
@@ -421,33 +514,33 @@ public actor Transport {
         }
 
         guard let destHash = matchedDestHash, let link = matchedLink else {
-            logger.debug("No pending link found for proof linkId \(proofLinkId.data.prefix(4).hexEncodedString)")
+            logger.warning("handleLinkProof: no pending link matches proof \(proofHex); pendingLinks count=\(pendingLinks.count)")
             return
         }
 
-        // Look up peer identity from routing table
-        guard let routeEntry = await routingTable.lookup(destHash) else {
-            logger.warning("No route entry for destination \(destHash.data.prefix(4).hexEncodedString), cannot verify proof")
-            return
-        }
-
-        // Reconstruct peer Identity from public key bytes (X25519:32 + Ed25519:32)
-        // We need the Ed25519 signing public key for signature verification
-        guard routeEntry.publicKey.count == 64 else {
-            logger.warning("Invalid public key size in route entry")
-            return
-        }
+        // Look up peer identity from routing table. If we don't have an announce
+        // yet for the responder, fall back to processing the proof's ECDH portion
+        // alone — the link is then "tentatively" authenticated (confidential
+        // tunnel via ECDH, but no peer-identity verification until an announce
+        // catches up). This is the difference between "messages can flow now"
+        // and "messages never flow because we missed the 30-min announce window".
+        let routeEntryOpt = await routingTable.lookup(destHash)
 
         do {
-            // Create a verification-only Identity from the route entry's public key bytes.
-            // This Identity can verify signatures but cannot sign or decrypt.
-            let peerIdentity = try Identity(publicKeyBytes: routeEntry.publicKey)
-
-            try await link.processProof(
-                rawProofPacket: raw,
-                proofPacket: packet,
-                peerIdentity: peerIdentity
-            )
+            if let routeEntry = routeEntryOpt, routeEntry.publicKey.count == 64 {
+                let peerIdentity = try Identity(publicKeyBytes: routeEntry.publicKey)
+                try await link.processProof(
+                    rawProofPacket: raw,
+                    proofPacket: packet,
+                    peerIdentity: peerIdentity
+                )
+            } else {
+                logger.warning("handleLinkProof: no announce in routing table for \(destHash.data.prefix(4).hexEncodedString); accepting proof via ECDH only (peer identity NOT verified)")
+                try await link.processProofWithoutSignatureCheck(
+                    rawProofPacket: raw,
+                    proofPacket: packet
+                )
+            }
 
             // Create and send RTT packet
             let rttPacket = try await link.createRTTPacket()
@@ -530,33 +623,100 @@ public actor Transport {
             appData: appData ?? localAppData[destination.hash]
         )
         let packedData = try packet.pack()
+        let destHex = destination.hash.data.prefix(4).hexEncodedString
+
+        var sentOn: [String] = []
+        var rateLimitedOn: [String] = []
+        var offlineOn: [String] = []
+        var failedOn: [String] = []
 
         for interface in interfaces {
             let limiter = rateLimiters[interface.interfaceId]
             if let limiter, await !limiter.canSend() {
-                logger.debug("Rate limited on \(interface.interfaceId)")
+                rateLimitedOn.append(interface.interfaceId)
+                continue
+            }
+            let online = await interface.isOnline
+            guard online else {
+                offlineOn.append(interface.interfaceId)
+                logger.warning("sendAnnounce: \(destHex) -- interface \(interface.interfaceId) is offline; announce NOT transmitted there")
                 continue
             }
             do {
                 try await interface.send(packedData)
                 await limiter?.recordSend(packetSize: packedData.count)
+                sentOn.append(interface.interfaceId)
             } catch {
+                failedOn.append("\(interface.interfaceId)(\(error))")
                 logger.warning("Failed to send announce on \(interface.interfaceId): \(error)")
             }
+        }
+        if sentOn.isEmpty {
+            logger.warning("sendAnnounce: \(destHex) NOT TRANSMITTED -- offline=\(offlineOn) rateLimited=\(rateLimitedOn) failed=\(failedOn) (\(packedData.count) bytes)")
+        } else {
+            logger.info("sendAnnounce: \(destHex) sent on \(sentOn) (\(packedData.count) bytes)")
         }
     }
 
     // MARK: - Periodic Re-Announce
 
+    /// Returns true if at least one registered interface currently reports `isOnline`.
+    ///
+    /// Used by `startReAnnounce` to defer the very first announce until a transport
+    /// is actually capable of carrying bytes — without this, an announce issued
+    /// before BLE finishes its scan/connect/detect handshake is silently dropped.
+    public func hasAnyOnlineInterface() async -> Bool {
+        for iface in interfaces {
+            if await iface.isOnline { return true }
+        }
+        return false
+    }
+
     /// Start periodic re-announce of all registered destinations.
     ///
-    /// - Parameter interval: Time between re-announces in seconds. Defaults to 1800 (30 minutes).
-    public func startReAnnounce(interval: TimeInterval = 1800) async {
+    /// Behaviour:
+    ///   1. Wait (up to `initialOnlineTimeout`) for at least one interface to come
+    ///      online, polling every 1s. This avoids the BLE-not-yet-online race where
+    ///      `sendAnnounce` would otherwise log "NOT TRANSMITTED" and lose the
+    ///      first announce.
+    ///   2. Send the first announce immediately on every local destination.
+    ///   3. Loop: sleep `interval` seconds, send again.
+    ///
+    /// If no interface comes online within `initialOnlineTimeout`, the first
+    /// announce is still attempted (so the warning surfaces in logs) and the
+    /// periodic loop continues — a later online transition will be picked up
+    /// by the next iteration.
+    ///
+    /// - Parameters:
+    ///   - interval: Time between re-announces in seconds. Defaults to 1800 (30 minutes).
+    ///   - initialOnlineTimeout: Max seconds to wait for an interface before the
+    ///     first announce. Defaults to 60s.
+    public func startReAnnounce(interval: TimeInterval = 1800, initialOnlineTimeout: TimeInterval = 60) async {
         reAnnounceTask?.cancel()
         reAnnounceTask = Task { [weak self] in
+            guard let self else { return }
+
+            // Phase 1: wait for at least one online interface, with a safety deadline.
+            let deadline = Date().addingTimeInterval(initialOnlineTimeout)
+            while !Task.isCancelled {
+                if await self.hasAnyOnlineInterface() { break }
+                if Date() >= deadline {
+                    self.logger.warning("startReAnnounce: no interface came online within \(Int(initialOnlineTimeout))s; sending initial announce anyway (will log NOT TRANSMITTED)")
+                    break
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+            if Task.isCancelled { return }
+
+            // Phase 2: initial announce on every local destination.
+            for dest in await self.localDestinations {
+                try? await self.sendAnnounce(for: dest)
+            }
+
+            // Phase 3: periodic re-announce.
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(interval))
-                guard let self, !Task.isCancelled else { return }
+                guard !Task.isCancelled else { return }
                 for dest in await self.localDestinations {
                     try? await self.sendAnnounce(for: dest)
                 }
@@ -576,7 +736,7 @@ public actor Transport {
     public func shutdown() async {
         stopReAnnounce()
 
-        for task in interfaceListenerTasks {
+        for task in interfaceListenerTasks.values {
             task.cancel()
         }
         interfaceListenerTasks.removeAll()

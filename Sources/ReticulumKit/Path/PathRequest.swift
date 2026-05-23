@@ -1,31 +1,22 @@
 // SPDX-License-Identifier: MIT
 // PathRequest.swift — Path request packet creation and path response detection
 //
-// Stateless namespace (enum with no cases) matching project convention (Announce pattern).
-// Path requests are broadcast to a control destination derived from "path.request".
-// Transport nodes recognize these and respond with the destination's announce.
+// Path requests are broadcast packets ADDRESSED TO THE TARGET DESTINATION.
+// Per the Reticulum spec (and Python RNS Transport.request_path), the packet
+// header destination is the destination we are asking for. Any node that has
+// a routing entry for that destination — most commonly the destination itself
+// — replies with an announce in `pathResponse` context.
 
 import Foundation
 
 /// Stateless namespace for path request creation and response detection.
 public enum PathRequest: Sendable {
 
-    /// Control destination hash for path requests.
-    ///
-    /// Derived as: truncatedHash(sha256("path.request"))
-    /// This is the simplified client-side approach. For an iOS leaf node connecting
-    /// via TCP to a transport node, path requests are broadcast to this control
-    /// destination. The transport node recognizes them and responds.
-    public static let controlDestinationHash: TruncatedHash = {
-        let hash = CryptoEngine.truncatedHash(CryptoEngine.sha256(Data("path.request".utf8)))
-        return try! TruncatedHash(hash)
-    }()
-
     /// Create a path request packet for a target destination hash.
     ///
-    /// The packet is addressed to the control destination with the target hash
-    /// as payload. Transport nodes recognize the control destination and respond
-    /// with the target's announce if they have it in their routing table.
+    /// Wire layout: HT=type1, PROP=broadcast, DEST=plain, packetType=.data,
+    /// header.destinationHash = `targetHash`, payload = a random tag the
+    /// requester can use to correlate responses.
     ///
     /// - Parameter targetHash: The destination hash to request a path for.
     /// - Returns: A `Packet` ready for transmission through all interfaces.
@@ -37,12 +28,17 @@ public enum PathRequest: Sendable {
             packetType: .data
         )
 
+        // 10 random bytes as a request tag so responses can be correlated.
+        // Matches Python RNS Transport.request_path which sends a random hash
+        // as the request body.
+        let requestTag = (try? CryptoEngine.randomBytes(count: 10)) ?? Data(count: 10)
+
         return Packet(
             header: header,
-            destinationHash: controlDestinationHash,
+            destinationHash: targetHash,
             transportId: nil,
             context: .none,
-            data: targetHash.data
+            data: requestTag
         )
     }
 

@@ -47,10 +47,24 @@ public enum RNodeConstants: Sendable {
     public static let CMD_LT_ALOCK: UInt8 = 0x0C
     /// Radio ready indicator (RNode -> Host)
     public static let CMD_READY: UInt8 = 0x0F
+    /// BLE link state notification (RNode -> Host, 1 byte)
+    public static let CMD_BLE: UInt8 = 0x1F
+    /// RX packet count statistic (RNode -> Host)
+    public static let CMD_STAT_RX: UInt8 = 0x21
+    /// TX packet count statistic (RNode -> Host)
+    public static let CMD_STAT_TX: UInt8 = 0x22
     /// RSSI statistic (RNode -> Host, signed)
     public static let CMD_STAT_RSSI: UInt8 = 0x23
     /// SNR statistic (RNode -> Host, signed)
     public static let CMD_STAT_SNR: UInt8 = 0x24
+    /// Channel-time / airtime metrics (RNode -> Host)
+    public static let CMD_STAT_CHTM: UInt8 = 0x25
+    /// Physical-layer parameter snapshot (RNode -> Host)
+    public static let CMD_STAT_PHYPRM: UInt8 = 0x26
+    /// Battery state (RNode -> Host)
+    public static let CMD_STAT_BAT: UInt8 = 0x27
+    /// CSMA/queue state (RNode -> Host)
+    public static let CMD_STAT_CSMA: UInt8 = 0x28
     /// Platform identifier (RNode -> Host)
     public static let CMD_PLATFORM: UInt8 = 0x48
     /// MCU identifier (RNode -> Host)

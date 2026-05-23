@@ -30,8 +30,11 @@ struct LinkHandshakeTests {
             responderIdentity: responderIdentity
         )
 
+        // Responder holds the Token immediately after responding, so it goes
+        // straight to .active; the initiator's RTT packet is optional for the
+        // responder side (see Link.respondToRequest).
         let rStatus = await responderLink.status
-        #expect(rStatus == .handshake)
+        #expect(rStatus == .active)
 
         // Step 3: Initiator processes proof
         let rawProof = try proofPacket.pack()

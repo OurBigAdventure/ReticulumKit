@@ -114,36 +114,85 @@ public struct Identity: Sendable {
         CryptoEngine.verify(signature: signature, message: data, publicKey: signingPublicKey)
     }
 
-    /// Encrypt data to a recipient using their X25519 public key.
-    /// Performs ECDH + HKDF to derive shared Token key, then Token.encrypt.
-    public func encrypt(plaintext: Data, for recipientPublicKey: Curve25519.KeyAgreement.PublicKey) throws -> Data {
-        let sharedSecret = try CryptoEngine.keyAgreement(
-            privateKey: agreementPrivateKey,
-            publicKey: recipientPublicKey
-        )
-        let derivedKey = CryptoEngine.hkdf(
-            length: 64,  // 32 signing + 32 encryption for AES-256
-            inputKeyMaterial: sharedSecret.withUnsafeBytes { Data($0) },
-            salt: nil,
-            context: nil
-        )
-        let token = try Token(key: derivedKey)
-        return try token.encrypt(plaintext)
-    }
+    /// Encrypt data for a recipient using Reticulum/Python-RNS-compatible wire format.
+    ///
+    /// Wire format: `[ephemeral_pub:32] + [iv:16] + [ciphertext:var] + [hmac:32]`
+    ///
+    /// Procedure (matches `RNS.Identity.encrypt` in Python RNS):
+    /// 1. Generate an ephemeral X25519 keypair.
+    /// 2. ECDH(ephemeral_priv, recipient.agreementPublicKey) → shared secret.
+    /// 3. HKDF-SHA256(shared, salt = recipient.hash, length = 64) → 64-byte derived key.
+    /// 4. Token.encrypt(plaintext) with the derived key (32 sign + 32 enc for AES-256-CBC).
+    /// 5. Output = ephemeral_pub_bytes(32) + token.
+    ///
+    /// The `recipient` parameter must carry both the X25519 agreement public key AND the
+    /// Ed25519 signing public key so the recipient identity hash (used as HKDF salt) can
+    /// be reconstructed. Pass a verification-only Identity (constructed via
+    /// `init(publicKeyBytes:)`) when only public keys are known.
+    ///
+    /// Note: this is the "no ratchet" path. Per-destination ratchet keys are not yet
+    /// supported in Swift; modern peers that don't enforce ratchets fall back to the
+    /// destination's static identity key, which this implementation matches.
+    ///
+    /// - Parameters:
+    ///   - plaintext: Data to encrypt.
+    ///   - recipient: The recipient's identity (public-key form is sufficient).
+    /// - Returns: Encrypted token in Reticulum wire format.
+    public func encrypt(plaintext: Data, for recipient: Identity) throws -> Data {
+        let ephemeralPrivateKey = Curve25519.KeyAgreement.PrivateKey()
+        let ephemeralPubBytes = Data(ephemeralPrivateKey.publicKey.rawRepresentation)
 
-    /// Decrypt data from a sender using their X25519 public key.
-    public func decrypt(ciphertext: Data, from senderPublicKey: Curve25519.KeyAgreement.PublicKey) throws -> Data {
         let sharedSecret = try CryptoEngine.keyAgreement(
-            privateKey: agreementPrivateKey,
-            publicKey: senderPublicKey
+            privateKey: ephemeralPrivateKey,
+            publicKey: recipient.agreementPublicKey
         )
         let derivedKey = CryptoEngine.hkdf(
             length: 64,
             inputKeyMaterial: sharedSecret.withUnsafeBytes { Data($0) },
-            salt: nil,
+            salt: recipient.hash.data,
             context: nil
         )
         let token = try Token(key: derivedKey)
-        return try token.decrypt(ciphertext)
+        let ciphertext = try token.encrypt(plaintext)
+        return ephemeralPubBytes + ciphertext
+    }
+
+    /// Decrypt data sent to this identity using Reticulum/Python-RNS-compatible wire format.
+    ///
+    /// Wire format expected: `[ephemeral_pub:32] + [iv:16] + [ciphertext:var] + [hmac:32]`
+    ///
+    /// Procedure (matches `RNS.Identity.decrypt` in Python RNS):
+    /// 1. Strip the leading 32 bytes as the sender's ephemeral X25519 public key.
+    /// 2. ECDH(self.agreementPrivateKey, ephemeral_pub) → shared secret.
+    /// 3. HKDF-SHA256(shared, salt = self.hash, length = 64) → 64-byte derived key.
+    /// 4. Token.decrypt(remaining bytes) → plaintext.
+    ///
+    /// - Parameter ciphertext: Encrypted token in Reticulum wire format.
+    /// - Returns: Decrypted plaintext.
+    /// - Throws: `ReticulumError.tokenTooShort` if input is shorter than the ephemeral
+    ///   pubkey + minimum token overhead, or any error from underlying ECDH / token
+    ///   decryption (HMAC failure, padding, etc).
+    public func decrypt(ciphertext: Data) throws -> Data {
+        // Need at least 32 (ephemeral pubkey) + Token.overhead (48) bytes.
+        guard ciphertext.count > 32 + TokenConstants.overhead else {
+            throw ReticulumError.tokenTooShort
+        }
+
+        let ephemeralPubBytes = Data(ciphertext.prefix(32))
+        let tokenBytes = Data(ciphertext.dropFirst(32))
+
+        let ephemeralPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeralPubBytes)
+        let sharedSecret = try CryptoEngine.keyAgreement(
+            privateKey: agreementPrivateKey,
+            publicKey: ephemeralPub
+        )
+        let derivedKey = CryptoEngine.hkdf(
+            length: 64,
+            inputKeyMaterial: sharedSecret.withUnsafeBytes { Data($0) },
+            salt: hash.data,
+            context: nil
+        )
+        let token = try Token(key: derivedKey)
+        return try token.decrypt(tokenBytes)
     }
 }

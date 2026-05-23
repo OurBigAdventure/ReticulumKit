@@ -20,15 +20,20 @@ struct AnnounceTests {
         #expect(packet.header.propagationType == .broadcast)
         #expect(packet.header.destinationType == .single)
         #expect(packet.header.headerType == .type1)
+        // No ratchet support yet — context_flag must be 0 so Python RNS peers
+        // parse the payload as 148 bytes baseline (no 32-byte ratchet field).
+        #expect(packet.header.contextFlag == false)
     }
 
-    @Test("create payload is >= 148 bytes")
+    @Test("create payload is exactly 148 bytes (no appData, no ratchet)")
     func createPayloadMinimumSize() throws {
         let identity = Identity()
         let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
         let packet = try Announce.create(destination: destination)
 
-        #expect(packet.data.count >= 148)
+        // Python-RNS-compatible layout:
+        //   publicKey(64) + nameHash(10) + randomHash(10) + signature(64) = 148 bytes
+        #expect(packet.data.count == 148)
     }
 
     @Test("create -> validate round-trip succeeds")
@@ -41,6 +46,7 @@ struct AnnounceTests {
         #expect(result.destinationHash == destination.hash)
         #expect(result.publicKey == identity.publicKeyBytes)
         #expect(result.nameHash == destination.nameHash)
+        #expect(result.ratchet == nil)
     }
 
     @Test("create -> validate round-trip with appData")
@@ -81,7 +87,10 @@ struct AnnounceTests {
         let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
         let packet = try Announce.create(destination: destination)
 
-        // Create a packet with a different destination hash
+        // Create a packet with a different destination hash. The signature was
+        // computed over the original dest hash, so swapping it must surface as
+        // a signature mismatch (the destination-hash reconstruction check is
+        // gated behind a successful signature check in validate()).
         let forgedHash = try TruncatedHash(Data(repeating: 0xAA, count: 16))
         let forgedPacket = Packet(
             header: packet.header,
@@ -90,7 +99,7 @@ struct AnnounceTests {
             data: packet.data
         )
 
-        #expect(throws: AnnounceError.destinationHashMismatch) {
+        #expect(throws: AnnounceError.signatureInvalid) {
             try Announce.validate(packet: forgedPacket)
         }
     }
@@ -101,7 +110,7 @@ struct AnnounceTests {
         let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
         let packet = try Announce.create(destination: destination)
 
-        // Corrupt signature bytes (bytes 84..<148 in payload)
+        // Corrupt signature bytes (bytes 84..<148 in payload, no ratchet).
         var corruptedData = packet.data
         corruptedData[84] ^= 0xFF
         corruptedData[85] ^= 0xFF
@@ -127,10 +136,36 @@ struct AnnounceTests {
 
         #expect(result.publicKey.count == 64)
         #expect(result.nameHash.count == 10)
+        // Python-RNS-compatible random hash: 5 random bytes + 5-byte big-endian
+        // Unix timestamp = 10 bytes total. Fixed across all RNS versions.
         #expect(result.randomHash.count == 10)
         #expect(result.signature.count == 64)
+        #expect(result.ratchet == nil)
         #expect(result.publicKey == identity.publicKeyBytes)
         #expect(result.nameHash == destination.nameHash)
+    }
+
+    @Test("randomHash trailing 5 bytes encode current Unix timestamp big-endian")
+    func randomHashTrailingTimestamp() throws {
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
+
+        let beforeTs = UInt64(Date().timeIntervalSince1970)
+        let packet = try Announce.create(destination: destination)
+        let afterTs = UInt64(Date().timeIntervalSince1970)
+        let result = try Announce.validate(packet: packet)
+
+        // Bytes 5..10 are the timestamp, 5 bytes big-endian unsigned.
+        let tsBytes = Array(result.randomHash[5..<10])
+        let parsedTs =
+            (UInt64(tsBytes[0]) << 32) |
+            (UInt64(tsBytes[1]) << 24) |
+            (UInt64(tsBytes[2]) << 16) |
+            (UInt64(tsBytes[3]) << 8) |
+             UInt64(tsBytes[4])
+
+        #expect(parsedTs >= beforeTs)
+        #expect(parsedTs <= afterTs)
     }
 
     @Test("signed data does NOT contain signature (verify by checking signed data length)")
@@ -139,9 +174,10 @@ struct AnnounceTests {
         let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
         let packet = try Announce.create(destination: destination)
 
-        // The signed data is: destHash(16) + publicKey(64) + nameHash(10) + randomHash(10) = 100 bytes
-        // Without appData, payload = publicKey(64) + nameHash(10) + randomHash(10) + signature(64) = 148 bytes
-        // So payload is 148, but signed data is only 100 bytes (no signature in signed data)
+        // Python-RNS-compatible announce payload (no appData, no ratchet):
+        //   publicKey(64) + nameHash(10) + randomHash(10) + signature(64) = 148 bytes
+        // Signed data (NOT in payload, only used for signature):
+        //   destHash(16) + publicKey(64) + nameHash(10) + randomHash(10) = 100 bytes
         #expect(packet.data.count == 148)
 
         // Verify the round-trip works (if signature was in signed data, it would fail)

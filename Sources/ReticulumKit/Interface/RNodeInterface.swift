@@ -508,7 +508,7 @@ public actor RNodeInterface: NetworkInterface {
             case RNodeConstants.CMD_DATA:
                 // Reticulum packet -- yield to incoming stream
                 // T-08-06: Log size only
-                logger.debug("Received \(frame.payload.count) bytes on ble-rnode")
+                logger.info("rnode rx: \(frame.payload.count) bytes from radio (forwarding to transport)")
                 packetContinuation?.yield(frame.payload)
 
             case RNodeConstants.CMD_DETECT:
@@ -544,8 +544,27 @@ public actor RNodeInterface: NetworkInterface {
             case RNodeConstants.CMD_FW_VERSION:
                 logger.info("RNode firmware version: \(frame.payload.map { String(format: "%02X", $0) }.joined())")
 
+            // Periodic firmware telemetry — known shape, not actionable; quiet at debug.
+            case RNodeConstants.CMD_BLE,
+                 RNodeConstants.CMD_STAT_RX,
+                 RNodeConstants.CMD_STAT_TX,
+                 RNodeConstants.CMD_STAT_CHTM,
+                 RNodeConstants.CMD_STAT_PHYPRM,
+                 RNodeConstants.CMD_STAT_BAT,
+                 RNodeConstants.CMD_STAT_CSMA:
+                logger.debug("rnode telemetry cmd 0x\(String(format: "%02X", frame.command)) (\(frame.payload.count) bytes)")
+
+            // Firmware echoes our radio-config commands back as ACKs.
+            case RNodeConstants.CMD_FREQUENCY,
+                 RNodeConstants.CMD_BANDWIDTH,
+                 RNodeConstants.CMD_TXPOWER,
+                 RNodeConstants.CMD_SF,
+                 RNodeConstants.CMD_CR,
+                 RNodeConstants.CMD_RADIO_STATE:
+                logger.debug("rnode config ack cmd 0x\(String(format: "%02X", frame.command)) (\(frame.payload.count) bytes)")
+
             default:
-                logger.debug("RNode command 0x\(String(format: "%02X", frame.command)) with \(frame.payload.count) bytes")
+                logger.info("rnode rx: unhandled command 0x\(String(format: "%02X", frame.command)) with \(frame.payload.count) bytes")
             }
         }
     }

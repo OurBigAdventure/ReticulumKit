@@ -13,17 +13,7 @@ private func makeHash(_ byte: UInt8) -> TruncatedHash {
 @Suite("PathRequest")
 struct PathRequestTests {
 
-    @Test("controlDestinationHash is derived from SHA-256 of 'path.request' truncated to 16 bytes")
-    func controlDestinationHash() throws {
-        let hash = PathRequest.controlDestinationHash
-        #expect(hash.data.count == 16)
-
-        // Verify derivation: truncatedHash(sha256("path.request"))
-        let expected = CryptoEngine.truncatedHash(CryptoEngine.sha256(Data("path.request".utf8)))
-        #expect(hash.data == expected)
-    }
-
-    @Test("create produces a data packet addressed to controlDestinationHash")
+    @Test("create produces a broadcast data packet addressed to the target destination hash")
     func createPacket() throws {
         let targetHash = makeHash(0xBB)
         let packet = try PathRequest.create(targetHash: targetHash)
@@ -32,8 +22,11 @@ struct PathRequestTests {
         #expect(packet.header.destinationType == .plain)
         #expect(packet.header.propagationType == .broadcast)
         #expect(packet.context == .none)
-        #expect(packet.destinationHash == PathRequest.controlDestinationHash)
-        #expect(packet.data == targetHash.data)
+        // Per the Reticulum spec, the path request is addressed TO the target
+        // destination — any node holding a route to it (most often the target
+        // itself) replies with an announce.
+        #expect(packet.destinationHash == targetHash)
+        #expect(packet.data.count == 10, "request tag should be 10 random bytes")
     }
 
     @Test("create packet can be packed without error")
@@ -152,8 +145,9 @@ struct TransportPathRequestTests {
             let packet = try Packet.unpack(sentData)
             #expect(packet.header.packetType == .data)
             #expect(packet.header.destinationType == .plain)
-            #expect(packet.destinationHash == PathRequest.controlDestinationHash)
-            #expect(packet.data == targetHash.data)
+            // Path request is addressed to the target destination per the spec.
+            #expect(packet.destinationHash == targetHash)
+            #expect(packet.data.count == 10, "request tag should be 10 random bytes")
         }
     }
 
