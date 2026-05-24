@@ -4,7 +4,7 @@ ReticulumKit implements cryptographic networking primitives. We take security is
 
 ## Supported versions
 
-ReticulumKit is in active pre-1.0 development. Security fixes are applied to the latest released version and `main`. Older `0.x` tags are not maintained — please upgrade to the latest release.
+ReticulumKit is in active pre-1.0 development. Security fixes are applied to the latest released version and `main`. Older `0.x` tags are not maintained, so please upgrade to the latest release.
 
 ## Reporting a vulnerability
 
@@ -12,8 +12,8 @@ ReticulumKit is in active pre-1.0 development. Security fixes are applied to the
 
 Instead, report privately using one of:
 
-- **GitHub Security Advisories** — use the [Report a vulnerability](https://github.com/J-Krush/ReticulumKit/security/advisories/new) button under the repository's **Security** tab (preferred — it keeps the report and fix coordination in one place).
-- **Email** — `jkrush@pm.me`. Use a clear subject line such as "ReticulumKit security report".
+- **GitHub Security Advisories:** use the [Report a vulnerability](https://github.com/J-Krush/ReticulumKit/security/advisories/new) button under the repository's **Security** tab (preferred, since it keeps the report and fix coordination in one place).
+- **Email:** `jkrush@pm.me`. Use a clear subject line such as "ReticulumKit security report".
 
 Please include:
 

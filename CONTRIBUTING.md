@@ -1,15 +1,15 @@
 # Contributing to ReticulumKit
 
-Thanks for your interest in contributing! ReticulumKit is an independent Swift implementation of the Reticulum protocol, and contributions — bug reports, fixes, tests, docs, and features — are all welcome.
+Thanks for your interest in contributing! ReticulumKit is an independent Swift implementation of the Reticulum protocol, and contributions (bug reports, fixes, tests, docs, and features) are all welcome.
 
 By participating in this project you agree to abide by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to contribute
 
-- **Report a bug** — open an [issue](https://github.com/J-Krush/ReticulumKit/issues). For wire-compatibility bugs (ReticulumKit disagreeing with Python RNS), include a packet capture or a byte-level fixture if you can.
-- **Suggest a feature** — open an issue to discuss it first so we can agree on scope before you invest time.
-- **Send a pull request** — fix a bug, add tests, or implement an agreed feature.
-- **Improve docs** — typos, clarifications, and examples are genuinely valuable.
+- **Report a bug:** open an [issue](https://github.com/J-Krush/ReticulumKit/issues). For wire-compatibility bugs (ReticulumKit disagreeing with Python RNS), include a packet capture or a byte-level fixture if you can.
+- **Suggest a feature:** open an issue to discuss it first so we can agree on scope before you invest time.
+- **Send a pull request:** fix a bug, add tests, or implement an agreed feature.
+- **Improve docs:** typos, clarifications, and examples are genuinely valuable.
 
 ## Development setup
 
@@ -32,11 +32,11 @@ The `main` branch is protected: it does not accept direct pushes or force-pushes
    ```bash
    git checkout -b fix/announce-ratchet-length
    ```
-2. **Make your change.** Keep the PR focused — one logical change per PR.
+2. **Make your change.** Keep the PR focused: one logical change per PR.
 3. **Add or update tests.** New behavior needs test coverage; bug fixes should include a regression test.
 4. **Run `swift build` and `swift test`** locally and make sure both are green.
 5. **Open a pull request** against `main`. Fill out the PR template, describe what changed and why, and link any related issue.
-6. A maintainer will review. Address feedback by pushing new commits to your branch (don't force-push during review unless asked — it makes re-review harder).
+6. A maintainer will review. Address feedback by pushing new commits to your branch (don't force-push during review unless asked, since it makes re-review harder).
 7. Once approved and all conversations are resolved, a maintainer will merge.
 
 ## Commit messages
@@ -62,7 +62,7 @@ Common types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`.
 
 ## Wire compatibility
 
-ReticulumKit's defining constraint is byte-for-byte compatibility with the reference Python RNS implementation. When you touch anything that serializes to the wire — packets, headers, announces, the link handshake, hashing — cite the corresponding Python source in a code comment and back the change with a fixture-based test. A change that is "cleaner" but breaks interop with Sideband / MeshChat / NomadNet will not be merged.
+ReticulumKit's defining constraint is byte-for-byte compatibility with the reference Python RNS implementation. When you touch anything that serializes to the wire (packets, headers, announces, the link handshake, hashing), cite the corresponding Python source in a code comment and back the change with a fixture-based test. A change that is "cleaner" but breaks interop with Sideband / MeshChat / NomadNet will not be merged.
 
 ## Licensing of contributions
 
