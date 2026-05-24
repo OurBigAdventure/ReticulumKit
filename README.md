@@ -9,6 +9,10 @@ A pure-Swift implementation of the [Reticulum](https://reticulum.network) crypto
 
 ReticulumKit lets you build apps that speak Reticulum natively — no Python runtime, no bridging, no daemon. It is wire-compatible with the reference [Python Reticulum](https://github.com/markqvist/Reticulum) stack, so nodes built with ReticulumKit interoperate with [Sideband](https://github.com/markqvist/Sideband), [MeshChat](https://github.com/liamcottle/reticulum-meshchat), [NomadNet](https://github.com/markqvist/NomadNet), and any other RNS peer on the network.
 
+> **Independent project.** ReticulumKit is an independent, clean-room Swift implementation of the Reticulum protocol. Reticulum and its reference Python implementation are created by [Mark Qvist](https://github.com/markqvist). ReticulumKit is not affiliated with or endorsed by the Reticulum project.
+>
+> **Built with AI assistance.** ReticulumKit is written and maintained by a Swift developer, with AI assistance used as part of the development workflow. The code is human-reviewed and backed by a test suite verified against the reference implementation.
+
 > **Status: alpha (`v0.1.0`).** The public API may change before `1.0`. It is wire-tested against Python RNS, but treat it as pre-release and pin to an exact version.
 
 ## What is Reticulum?
@@ -143,6 +147,4 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 
 ## License
 
-ReticulumKit is released under the [MIT License](LICENSE).
-
-This is an independent, clean-room Swift implementation of the Reticulum protocol. Reticulum and the reference Python implementation are created by [Mark Qvist](https://github.com/markqvist) and are likewise MIT-licensed. ReticulumKit is not affiliated with or endorsed by the Reticulum project.
+ReticulumKit is released under the [MIT License](LICENSE). Reticulum and its reference Python implementation, created by [Mark Qvist](https://github.com/markqvist), are likewise MIT-licensed.
