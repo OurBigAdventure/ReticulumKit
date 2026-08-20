@@ -74,13 +74,37 @@ public actor Transport {
     /// Callbacks for validated incoming announces.
     private var announceCallbacks: [@Sendable (AnnounceResult) async -> Void] = []
 
+    /// Optional directory for persisting `destination_table.json`.
+    private let storageDirectory: URL?
+
+    /// Debounced persist of the routing table.
+    private var persistTask: Task<Void, Never>?
+
     /// Logger for transport events.
     private let logger = Logger(label: "reticulumkit.transport")
 
     // MARK: - Initialization
 
-    public init() {}
+    /// - Parameter storageDirectory: When set, learned paths are loaded via
+    ///   ``loadPersistedRoutes()`` and written after announce updates.
+    public init(storageDirectory: URL? = nil) {
+        self.storageDirectory = storageDirectory
+    }
 
+    /// Load `destination_table.json` from the configured storage directory.
+    public func loadPersistedRoutes() async {
+        await routingTable.load(from: storageDirectory)
+    }
+
+    private func persistRoutesSoon() {
+        guard storageDirectory != nil else { return }
+        persistTask?.cancel()
+        persistTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard let self, !Task.isCancelled else { return }
+            await self.routingTable.save(to: self.storageDirectory)
+        }
+    }
     // MARK: - Interface Management
 
     /// Register a network interface and start listening for incoming packets.
@@ -376,7 +400,10 @@ public actor Transport {
             randomBlobs: [result.randomHash]
         )
 
-        await routingTable.addEntry(entry)
+        let changed = await routingTable.addEntry(entry)
+        if changed {
+            persistRoutesSoon()
+        }
 
         // Notify announce callbacks
         for callback in announceCallbacks {

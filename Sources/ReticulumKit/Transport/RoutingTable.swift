@@ -122,6 +122,59 @@ public actor RoutingTable {
         entries.count
     }
 
+    /// Restore entries previously written by ``save(to:)``.
+    public func load(from directory: URL?) {
+        guard let directory else { return }
+        let url = directory.appendingPathComponent("destination_table.json")
+        guard let data = try? Data(contentsOf: url),
+              let snapshot = try? JSONDecoder().decode([PersistedRoute].self, from: data)
+        else { return }
+        var restored: [TruncatedHash: RouteEntry] = [:]
+        for row in snapshot {
+            guard let hashData = Data(hexString: row.destinationHex),
+                  let hash = try? TruncatedHash(hashData),
+                  let publicKey = Data(hexString: row.publicKeyHex),
+                  let nameHash = Data(hexString: row.nameHashHex)
+            else { continue }
+            restored[hash] = RouteEntry(
+                destinationHash: hash,
+                publicKey: publicKey,
+                nameHash: nameHash,
+                appData: row.appDataHex.flatMap { Data(hexString: $0) },
+                hops: row.hops,
+                timestamp: row.timestamp,
+                interfaceId: row.interfaceId,
+                emittedAt: row.emittedAt,
+                expires: row.expires,
+                randomBlobs: row.randomBlobHexes.compactMap { Data(hexString: $0) }
+            )
+        }
+        entries = restored
+    }
+
+    /// Write the table to `destination_table.json` in `directory`.
+    public func save(to directory: URL?) {
+        guard let directory else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let snapshot = entries.values.map { entry in
+            PersistedRoute(
+                destinationHex: entry.destinationHash.hexString,
+                publicKeyHex: entry.publicKey.hexString,
+                nameHashHex: entry.nameHash.hexString,
+                appDataHex: entry.appData?.hexString,
+                hops: entry.hops,
+                timestamp: entry.timestamp,
+                emittedAt: entry.emittedAt,
+                expires: entry.expires,
+                interfaceId: entry.interfaceId,
+                randomBlobHexes: entry.randomBlobs.map(\.hexString)
+            )
+        }
+        let url = directory.appendingPathComponent("destination_table.json")
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? data.write(to: url, options: [.atomic])
+    }
+
     // MARK: - Python path selection
 
     /// Mirrors `should_add` in Python `Transport.inbound` for announces.
@@ -174,5 +227,38 @@ public actor RoutingTable {
     private static func timebase(of blob: Data) -> UInt64 {
         guard blob.count >= 10 else { return 0 }
         return blob.subdata(in: 5..<10).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+    }
+}
+
+private struct PersistedRoute: Codable {
+    var destinationHex: String
+    var publicKeyHex: String
+    var nameHashHex: String
+    var appDataHex: String?
+    var hops: UInt8
+    var timestamp: Date
+    var emittedAt: UInt64
+    var expires: Date
+    var interfaceId: String
+    var randomBlobHexes: [String]
+}
+
+private extension Data {
+    init?(hexString: String) {
+        let hex = hexString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard hex.count.isMultiple(of: 2) else { return nil }
+        var data = Data(capacity: hex.count / 2)
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            guard let byte = UInt8(hex[index..<next], radix: 16) else { return nil }
+            data.append(byte)
+            index = next
+        }
+        self = data
+    }
+
+    var hexString: String {
+        map { String(format: "%02x", $0) }.joined()
     }
 }

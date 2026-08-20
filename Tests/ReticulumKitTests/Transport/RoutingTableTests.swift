@@ -163,4 +163,20 @@ struct RoutingTableTests {
         try await table.addEntry(makeEntry(hashByte: 0x02))
         #expect(await table.count == 2)
     }
+
+    @Test("save and load restores emittedAt and interface")
+    func persistRoundTrip() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let table = RoutingTable()
+        let entry = try makeEntry(hashByte: 0xAB, hops: 3, interfaceId: "tcp-hub", emittedAt: 1_700_000_042)
+        await table.addEntry(entry)
+        await table.save(to: dir)
+
+        let restored = RoutingTable()
+        await restored.load(from: dir)
+        let result = await restored.lookup(try makeHash(0xAB))
+        #expect(result?.hops == 3)
+        #expect(result?.interfaceId == "tcp-hub")
+        #expect(result?.emittedAt == 1_700_000_042)
+    }
 }
