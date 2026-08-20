@@ -330,6 +330,15 @@ public actor Transport {
         pathRequestTimes[destinationHash] = Date()
     }
 
+    /// Remove a destination from the path table (Python `Reticulum.drop_path`).
+    ///
+    /// Upper layers (e.g. LXMF retries) call this after a pathless budget so a
+    /// stale next hop is discarded before the next `requestPath`.
+    public func dropPath(_ destinationHash: TruncatedHash) async {
+        await routingTable.removeEntry(destinationHash)
+        logger.info("dropPath: \(destinationHash.data.prefix(4).hexEncodedString)")
+    }
+
     /// Handle an incoming announce packet.
     ///
     /// Validates the announce (signature + destination hash reconstruction),
