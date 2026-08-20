@@ -233,12 +233,14 @@ public actor Transport {
         case .data:
             if packet.header.destinationType == .link {
                 await handleLinkData(packet, from: interface)
+            } else if packet.header.destinationType == .plain,
+                      let target = PathRequest.targetHash(from: packet) {
+                // Python control dest `rnstransport.path.request`.
+                await handleIncomingPathRequest(targetHash: target, from: interface)
             } else if packet.header.destinationType == .plain
                 && localDestinations.contains(where: { $0.hash == packet.destinationHash }) {
-                // A broadcast `.data .plain` packet addressed to one of our
-                // local destinations — treat as a path request from a peer
-                // looking us up. Reply with our announce in pathResponse ctx.
-                await handleIncomingPathRequest(packet, from: interface)
+                // Legacy kit format: path request addressed to our local dest.
+                await handleIncomingPathRequest(targetHash: packet.destinationHash, from: interface)
             } else {
                 if let packetDataCallback {
                     await packetDataCallback(packet)
@@ -249,20 +251,15 @@ public actor Transport {
         }
     }
 
-    /// Respond to an incoming path request.
+    /// Reply with our announce in `pathResponse` context when a peer looks us up.
     ///
-    /// Path requests are broadcast `.data .plain` packets whose header destination
-    /// is the destination being looked up. If the looked-up hash is one of our
-    /// local destinations, reply with our announce in `pathResponse` context so
-    /// the requester learns where to find us. Without this, peers like Sideband /
-    /// Columba spin forever when adding us by hash.
-    private func handleIncomingPathRequest(_ packet: Packet, from interface: any NetworkInterface) async {
-        let targetHash = packet.destinationHash
+    /// Accepts Python-format requests (`rnstransport.path.request` + target in
+    /// payload) and the legacy kit format (addressed to our local destination).
+    private func handleIncomingPathRequest(targetHash: TruncatedHash, from interface: any NetworkInterface) async {
         let targetHex = targetHash.data.prefix(4).hexEncodedString
 
         guard let localDest = localDestinations.first(where: { $0.hash == targetHash }) else {
-            // Should be impossible because the dispatch already checked, but be defensive.
-            logger.debug("path request: dispatch matched but destination missing for \(targetHex)")
+            logger.debug("path request: not for a local destination \(targetHex)")
             return
         }
 

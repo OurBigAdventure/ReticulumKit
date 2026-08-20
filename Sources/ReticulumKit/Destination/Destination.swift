@@ -48,4 +48,13 @@ public struct Destination: Sendable {
         let full = CryptoEngine.truncatedHash(material)
         return try! TruncatedHash(full)
     }
+
+    /// Hash of a PLAIN destination (no identity), matching Python `Destination.hash(None, app, *aspects)`.
+    ///
+    /// Used for control traffic such as `rnstransport.path.request`.
+    public static func plainHash(appName: String, aspects: [String] = []) -> TruncatedHash {
+        let expanded = ([appName] + aspects).joined(separator: ".")
+        let nameHash = Data(CryptoEngine.sha256(Data(expanded.utf8)).prefix(ReticulumConstants.nameHashLength))
+        return try! TruncatedHash(CryptoEngine.truncatedHash(nameHash))
+    }
 }

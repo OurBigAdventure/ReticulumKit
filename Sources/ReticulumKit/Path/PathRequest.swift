@@ -1,25 +1,35 @@
 // SPDX-License-Identifier: MIT
 // PathRequest.swift — Path request packet creation and path response detection
 //
-// Path requests are broadcast packets ADDRESSED TO THE TARGET DESTINATION.
-// Per the Reticulum spec (and Python RNS Transport.request_path), the packet
-// header destination is the destination we are asking for. Any node that has
-// a routing entry for that destination — most commonly the destination itself
-// — replies with an announce in `pathResponse` context.
+// Wire format matches Python RNS `Transport.request_path` for a non-transport
+// client (`RNS/Transport.py`):
+//   - Header destination is the PLAIN dest `rnstransport.path.request`
+//     (not the hash being looked up).
+//   - Payload is `targetHash(16) + requestTag(16)`.
+// Transport nodes listen on that PLAIN dest and reply with an announce in
+// `pathResponse` context. See Python `path_request_handler`.
 
 import Foundation
 
 /// Stateless namespace for path request creation and response detection.
 public enum PathRequest: Sendable {
 
+    /// Application name of the RNS transport control destination.
+    public static let transportAppName = "rnstransport"
+
+    /// PLAIN destination hash hubs listen on for path requests.
+    public static let controlDestinationHash: TruncatedHash = Destination.plainHash(
+        appName: transportAppName,
+        aspects: ["path", "request"]
+    )
+
+    /// Truncated-hash length used for the lookup target and the request tag.
+    public static let tagLength = ReticulumConstants.truncatedHashLength
+
     /// Create a path request packet for a target destination hash.
     ///
-    /// Wire layout: HT=type1, PROP=broadcast, DEST=plain, packetType=.data,
-    /// header.destinationHash = `targetHash`, payload = a random tag the
-    /// requester can use to correlate responses.
-    ///
     /// - Parameter targetHash: The destination hash to request a path for.
-    /// - Returns: A `Packet` ready for transmission through all interfaces.
+    /// - Returns: A `Packet` ready for transmission.
     public static func create(targetHash: TruncatedHash) throws -> Packet {
         let header = PacketHeader(
             headerType: .type1,
@@ -28,28 +38,33 @@ public enum PathRequest: Sendable {
             packetType: .data
         )
 
-        // 10 random bytes as a request tag so responses can be correlated.
-        // Matches Python RNS Transport.request_path which sends a random hash
-        // as the request body.
-        let requestTag = (try? CryptoEngine.randomBytes(count: 10)) ?? Data(count: 10)
+        // Python `Identity.get_random_hash()`: 16-byte truncated hash.
+        let requestTag = (try? CryptoEngine.truncatedHash(CryptoEngine.randomBytes(count: 32)))
+            ?? Data(count: tagLength)
+        let payload = targetHash.data + requestTag
 
         return Packet(
             header: header,
-            destinationHash: targetHash,
+            destinationHash: controlDestinationHash,
             transportId: nil,
             context: .none,
-            data: requestTag
+            data: payload
         )
+    }
+
+    /// The destination being looked up, if this packet is a Python-format path request.
+    public static func targetHash(from packet: Packet) -> TruncatedHash? {
+        guard packet.header.packetType == .data,
+              packet.header.destinationType == .plain,
+              packet.destinationHash == controlDestinationHash,
+              packet.data.count >= tagLength
+        else { return nil }
+        return try? TruncatedHash(Data(packet.data.prefix(tagLength)))
     }
 
     /// Check if a packet is a path response.
     ///
     /// Path responses are announce packets with `pathResponse` context.
-    /// They contain the same payload as a normal announce but arrive in
-    /// response to a path request rather than being spontaneously broadcast.
-    ///
-    /// - Parameter packet: The packet to check.
-    /// - Returns: `true` if the packet is a path response announce.
     public static func isPathResponse(_ packet: Packet) -> Bool {
         packet.header.packetType == .announce && packet.context == .pathResponse
     }

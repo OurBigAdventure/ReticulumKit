@@ -13,7 +13,7 @@ private func makeHash(_ byte: UInt8) -> TruncatedHash {
 @Suite("PathRequest")
 struct PathRequestTests {
 
-    @Test("create produces a broadcast data packet addressed to the target destination hash")
+    @Test("create produces a PLAIN path-request packet addressed to rnstransport.path.request")
     func createPacket() throws {
         let targetHash = makeHash(0xBB)
         let packet = try PathRequest.create(targetHash: targetHash)
@@ -22,11 +22,10 @@ struct PathRequestTests {
         #expect(packet.header.destinationType == .plain)
         #expect(packet.header.propagationType == .broadcast)
         #expect(packet.context == .none)
-        // Per the Reticulum spec, the path request is addressed TO the target
-        // destination — any node holding a route to it (most often the target
-        // itself) replies with an announce.
-        #expect(packet.destinationHash == targetHash)
-        #expect(packet.data.count == 10, "request tag should be 10 random bytes")
+        #expect(packet.destinationHash == PathRequest.controlDestinationHash)
+        #expect(packet.data.count == 32, "payload should be target(16) + tag(16)")
+        #expect(Data(packet.data.prefix(16)) == targetHash.data)
+        #expect(PathRequest.targetHash(from: packet) == targetHash)
     }
 
     @Test("create packet can be packed without error")
@@ -145,9 +144,9 @@ struct TransportPathRequestTests {
             let packet = try Packet.unpack(sentData)
             #expect(packet.header.packetType == .data)
             #expect(packet.header.destinationType == .plain)
-            // Path request is addressed to the target destination per the spec.
-            #expect(packet.destinationHash == targetHash)
-            #expect(packet.data.count == 10, "request tag should be 10 random bytes")
+            #expect(packet.destinationHash == PathRequest.controlDestinationHash)
+            #expect(packet.data.count == 32, "payload should be target(16) + tag(16)")
+            #expect(Data(packet.data.prefix(16)) == targetHash.data)
         }
     }
 
