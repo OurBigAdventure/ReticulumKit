@@ -74,6 +74,12 @@ public actor Transport {
     /// Callbacks for validated incoming announces.
     private var announceCallbacks: [@Sendable (AnnounceResult) async -> Void] = []
 
+    /// Pending link REQUEST continuations keyed by truncated request id.
+    private var pendingLinkRequests: [Data: CheckedContinuation<Data, Error>] = [:]
+
+    /// Optional handler for inbound link REQUEST payloads `(link, pathHash, payload) -> responseData`.
+    private var linkRequestHandler: (@Sendable (Link, Data, Data) async -> Data?)?
+
     /// Logger for transport events.
     private let logger = Logger(label: "reticulumkit.transport")
 
@@ -156,6 +162,11 @@ public actor Transport {
     /// Register a callback for validated incoming announces.
     public func onAnnounce(_ callback: @escaping @Sendable (AnnounceResult) async -> Void) {
         announceCallbacks.append(callback)
+    }
+
+    /// Handle inbound link REQUEST packets (Python `Link.handle_request`) on hosted destinations.
+    public func onLinkRequest(_ handler: @escaping @Sendable (Link, Data, Data) async -> Data?) {
+        linkRequestHandler = handler
     }
 
     // MARK: - Interface Status
@@ -594,6 +605,44 @@ public actor Transport {
                 activeLinks.removeValue(forKey: linkId)
                 logger.info("Link \(linkId.data.prefix(4).hexEncodedString) closed by peer")
 
+            case .request:
+                let plaintext = try await link.decrypt(packet.data)
+                if let unpacked = LinkRequestCodec.unpackRequest(plaintext),
+                   let handler = linkRequestHandler,
+                   let responsePayload = await handler(link, unpacked.pathHash, unpacked.payload) {
+                    let requestId = CryptoEngine.truncatedHash(plaintext)
+                    let response = LinkRequestCodec.packResponse(requestId: requestId, payload: responsePayload)
+                    // Oversized replies (Resource is_response) are a follow-up; drop with a warning.
+                    guard response.count <= LinkConstants.mdu else {
+                        logger.warning(
+                            "Link REQUEST response exceeds Link.MDU (\(response.count) > \(LinkConstants.mdu)); not sent"
+                        )
+                        break
+                    }
+                    let encrypted = try await link.encrypt(response)
+                    let reply = Packet(
+                        header: PacketHeader(
+                            headerType: .type1,
+                            propagationType: .broadcast,
+                            destinationType: .link,
+                            packetType: .data
+                        ),
+                        destinationHash: linkId,
+                        context: .response,
+                        data: encrypted
+                    )
+                    try await sendPacket(reply)
+                }
+
+            case .response:
+                let plaintext = try await link.decrypt(packet.data)
+                if let unpacked = LinkRequestCodec.unpackResponse(plaintext),
+                   let cont = pendingLinkRequests.removeValue(forKey: unpacked.requestId) {
+                    cont.resume(returning: unpacked.payload)
+                } else if linkDataCallback != nil {
+                    await linkDataCallback?(packet, link)
+                }
+
             default:
                 if let linkDataCallback {
                     await linkDataCallback(packet, link)
@@ -603,6 +652,53 @@ public actor Transport {
             }
         } catch {
             logger.warning("Failed to handle link data: \(error)")
+        }
+    }
+
+    // MARK: - Link.request
+
+    /// Send a Python `Link.request` and await the RESPONSE payload bytes.
+    ///
+    /// Responses that fit in `Link.MDU` complete this call. Oversized Resource-backed
+    /// replies are not handled here.
+    public func linkRequest(
+        on link: Link,
+        path: String,
+        payload: Data?,
+        timeout: TimeInterval = 120
+    ) async throws -> Data {
+        let plaintext = LinkRequestCodec.packRequest(path: path, payload: payload)
+        let requestId = CryptoEngine.truncatedHash(plaintext)
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingLinkRequests[requestId] = continuation
+            Task {
+                do {
+                    let encrypted = try await link.encrypt(plaintext)
+                    let linkId = await link.linkId
+                    let packet = Packet(
+                        header: PacketHeader(
+                            headerType: .type1,
+                            propagationType: .broadcast,
+                            destinationType: .link,
+                            packetType: .data
+                        ),
+                        destinationHash: linkId,
+                        context: .request,
+                        data: encrypted
+                    )
+                    try await sendPacket(packet)
+                } catch {
+                    if pendingLinkRequests.removeValue(forKey: requestId) != nil {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+            Task {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                if pendingLinkRequests.removeValue(forKey: requestId) != nil {
+                    continuation.resume(throwing: ReticulumError.linkRequestTimeout)
+                }
+            }
         }
     }
 

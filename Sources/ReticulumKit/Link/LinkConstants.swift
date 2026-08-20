@@ -20,6 +20,13 @@ public enum LinkConstants: Sendable {
     /// Signalling bytes appended to link request data beyond ecPubSize
     public static let linkMTUSize = 3
 
+    /// Maximum plaintext in one encrypted link packet (Python `RNS.Link.MDU` = 431).
+    ///
+    /// `floor((MTU - IFAC_MIN - HEADER_MIN - TOKEN_OVERHEAD) / 16) * 16 - 1`
+    public static let mdu =
+        ((ReticulumConstants.MTU - ReticulumConstants.ifacMinSize
+          - ReticulumConstants.headerMinSize - TokenConstants.overhead) / 16) * 16 - 1
+
     // MARK: - Link Establishment
 
     /// Timeout per hop for link establishment (seconds)

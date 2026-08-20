@@ -28,4 +28,6 @@ public enum ReticulumError: Error, Sendable {
     case linkInvalidProof(String)
     case linkRequestTooShort(Int)
     case linkNoToken
+    /// Timed out waiting for a link REQUEST response (Python `Link.request` timeout).
+    case linkRequestTimeout
 }

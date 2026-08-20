@@ -1,0 +1,9 @@
+{
+  "link_request": {
+    "path": "/get",
+    "timestamp": 1700000000.0,
+    "path_hash_hex": "9dc1a72883468f57fed571e796e9ce98",
+    "payload_hex": "92c0c0",
+    "packed_request_hex": "93cb41d954fc40000000c4109dc1a72883468f57fed571e796e9ce9892c0c0"
+  }
+}
