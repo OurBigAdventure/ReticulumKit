@@ -13,8 +13,15 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CBZip2",
+            publicHeadersPath: "include",
+            cSettings: [.headerSearchPath("include")],
+            linkerSettings: [.linkedLibrary("bz2")]
+        ),
+        .target(
             name: "ReticulumKit",
             dependencies: [
+                "CBZip2",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "DMMessagePack", package: "msgpack-swift"),
             ]

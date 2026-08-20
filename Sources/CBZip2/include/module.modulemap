@@ -1,0 +1,4 @@
+module CBZip2 {
+    umbrella header "CBZip2.h"
+    export *
+}

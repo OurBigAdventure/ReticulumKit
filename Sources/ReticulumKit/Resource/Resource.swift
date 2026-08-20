@@ -7,8 +7,8 @@
 // assembled stream, strips the random prefix, and proves with
 // SHA-256(plaintext + resource_hash).
 //
-// Deferred follow-ups: bz2 auto-compress (RK-12), dedicated HMU coverage (RK-13),
-// multi-segment size splits (RK-14), response Resources (RK-16).
+// Deferred follow-ups: dedicated HMU coverage (RK-13), multi-segment size splits
+// (RK-14), response Resources (RK-16).
 
 import Foundation
 import CryptoKit
@@ -69,8 +69,9 @@ public actor Resource {
 
     /// Prepare an outgoing resource. Does not advertise until `advertise()`.
     ///
-    /// Compression (`autoCompress`) is reserved for a follow-up; this core path
-    /// always sends uncompressed plaintext. The resource hash is over plaintext.
+    /// When `autoCompress` is true, the payload is bz2-compressed if that shrinks it
+    /// (Python `Resource(..., auto_compress=True)`). The resource hash is always over
+    /// uncompressed plaintext.
     public static func outgoing(
         plaintext: Data,
         link: Link,
@@ -82,10 +83,14 @@ public actor Resource {
             throw ReticulumError.linkInvalidState("resource requires an active link")
         }
         // Single-segment only; size-split multi-segment is a follow-up.
-        _ = autoCompress
         let segmentPlaintext = plaintext
-        let compressed = false
-        let streamBody = segmentPlaintext
+        var compressed = false
+        var streamBody = segmentPlaintext
+        if autoCompress, segmentPlaintext.count <= BZip2.maxDecompressedSize,
+           let bz = BZip2.compress(segmentPlaintext), bz.count < segmentPlaintext.count {
+            streamBody = bz
+            compressed = true
+        }
         let prefix = try CryptoEngine.randomBytes(count: ResourceConstants.randomHashSize)
         let encrypted = try await link.encrypt(prefix + streamBody)
         let sdu = ResourceConstants.sdu
@@ -463,12 +468,16 @@ public actor Resource {
                 throw ReticulumError.resourceFailed("short resource")
             }
             decrypted = Data(decrypted.dropFirst(ResourceConstants.randomHashSize))
-            // bz2 inflate is a follow-up; compressed ADV is treated as corrupt here.
+            let uncompressed: Data
             if compressed {
-                status = .corrupt
-                return
+                guard let inflated = BZip2.decompress(decrypted) else {
+                    status = .corrupt
+                    return
+                }
+                uncompressed = inflated
+            } else {
+                uncompressed = decrypted
             }
-            let uncompressed = decrypted
             let calculated = CryptoEngine.sha256(uncompressed + randomHash)
             guard calculated == hash else {
                 status = .corrupt
@@ -478,7 +487,9 @@ public actor Resource {
             try await sendPacket(linkPacket(context: .resourcePRF, data: hash + proof, packetType: .proof))
             assembledData = uncompressed
             status = .complete
-            logger.info("resource assembled hash=\(hash.prefix(4).hexEncodedString) bytes=\(uncompressed.count)")
+            logger.info(
+                "resource assembled hash=\(hash.prefix(4).hexEncodedString) bytes=\(uncompressed.count) compressed=\(compressed)"
+            )
         } catch {
             status = .corrupt
         }
