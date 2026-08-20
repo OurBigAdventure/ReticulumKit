@@ -178,12 +178,40 @@ public actor Transport {
 
     // MARK: - Packet Sending
 
-    /// Send a packet through all online interfaces.
+    /// Send a packet, preferring the path-table learned interface when known.
+    ///
+    /// Matches Python `Transport.outbound` using `path_table[dest][received_interface]`
+    /// for SINGLE traffic. PLAIN/GROUP broadcasts still go to every online interface.
     ///
     /// - Parameter packet: The packet to send.
     /// - Throws: If packing fails.
     public func sendPacket(_ packet: Packet) async throws {
         let packedData = try packet.pack()
+        let preferred: String?
+        if packet.header.packetType == .announce
+            || packet.header.destinationType == .plain
+            || packet.header.destinationType == .group {
+            preferred = nil
+        } else {
+            preferred = await routingTable.lookup(packet.destinationHash)?.interfaceId
+        }
+        await sendPacked(packedData, preferringInterfaceId: preferred)
+    }
+
+    /// Transmit packed bytes on one preferred online interface, or all if none.
+    private func sendPacked(_ packedData: Data, preferringInterfaceId preferredId: String?) async {
+        if let preferredId,
+           let match = interfaces.first(where: { $0.interfaceId == preferredId }) {
+            let online = await match.isOnline
+            if online {
+                do {
+                    try await match.send(packedData)
+                    return
+                } catch {
+                    logger.warning("Failed to send on preferred \(preferredId): \(error)")
+                }
+            }
+        }
         for interface in interfaces {
             let isOnline = await interface.isOnline
             guard isOnline else { continue }
@@ -411,19 +439,35 @@ public actor Transport {
 
         pendingLinks[destinationHash] = link
 
+        let preferredId = routeEntry?.interfaceId
         var sentOn = 0
-        for interface in interfaces {
-            let isOnline = await interface.isOnline
-            guard isOnline else {
-                logger.debug("establishLink: skipping offline interface \(interface.interfaceId)")
-                continue
+        if let preferredId,
+           let match = interfaces.first(where: { $0.interfaceId == preferredId }) {
+            let isOnline = await match.isOnline
+            if isOnline {
+                do {
+                    try await match.send(packedData)
+                    sentOn = 1
+                    logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent on preferred \(preferredId) (\(packedData.count) bytes)")
+                } catch {
+                    logger.warning("establishLink: failed on preferred \(preferredId): \(error)")
+                }
             }
-            do {
-                try await interface.send(packedData)
-                sentOn += 1
-                logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent on \(interface.interfaceId) (\(packedData.count) bytes)")
-            } catch {
-                logger.warning("establishLink: failed to send link request on \(interface.interfaceId): \(error)")
+        }
+        if sentOn == 0 {
+            for interface in interfaces {
+                let isOnline = await interface.isOnline
+                guard isOnline else {
+                    logger.debug("establishLink: skipping offline interface \(interface.interfaceId)")
+                    continue
+                }
+                do {
+                    try await interface.send(packedData)
+                    sentOn += 1
+                    logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent on \(interface.interfaceId) (\(packedData.count) bytes)")
+                } catch {
+                    logger.warning("establishLink: failed to send link request on \(interface.interfaceId): \(error)")
+                }
             }
         }
         if sentOn == 0 {
