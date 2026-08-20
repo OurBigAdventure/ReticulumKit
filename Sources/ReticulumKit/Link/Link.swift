@@ -53,6 +53,9 @@ public actor Link {
     private var keepaliveInterval: TimeInterval = LinkConstants.defaultKeepalive
     public private(set) var teardownReason: TeardownReason?
 
+    /// Optional Channel for `PacketContext.channel` frames.
+    public private(set) var channel: Channel?
+
     /// Test-accessible property: true if ephemeral private key is still held.
     public var hasEphemeralKey: Bool {
         ephemeralPrivateKey != nil
@@ -693,6 +696,13 @@ public actor Link {
             context: .linkIdentify,
             data: encrypted
         )
+    }
+
+    // MARK: - Channel
+
+    /// Attach a Channel used for `PacketContext.channel` frames.
+    public func attachChannel(_ channel: Channel) {
+        self.channel = channel
     }
 
     // MARK: - Activity Tracking

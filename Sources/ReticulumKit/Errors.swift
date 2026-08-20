@@ -28,4 +28,6 @@ public enum ReticulumError: Error, Sendable {
     case linkInvalidProof(String)
     case linkRequestTooShort(Int)
     case linkNoToken
+    /// Channel envelope exceeds `LinkConstants.mdu` after the 6-byte header.
+    case channelMessageTooLarge(Int)
 }

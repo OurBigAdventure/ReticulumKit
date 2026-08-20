@@ -594,6 +594,14 @@ public actor Transport {
                 activeLinks.removeValue(forKey: linkId)
                 logger.info("Link \(linkId.data.prefix(4).hexEncodedString) closed by peer")
 
+            case .channel:
+                let plaintext = try await link.decrypt(packet.data)
+                if let channel = await link.channel {
+                    await channel.receive(plaintext)
+                } else {
+                    logger.debug("Channel data with no Channel attached on \(linkId.data.prefix(4).hexEncodedString)")
+                }
+
             default:
                 if let linkDataCallback {
                     await linkDataCallback(packet, link)
@@ -604,6 +612,19 @@ public actor Transport {
         } catch {
             logger.warning("Failed to handle link data: \(error)")
         }
+    }
+
+    // MARK: - Channel
+
+    /// Open a Channel on an active link (creates one if needed).
+    public func channel(on link: Link) async -> Channel {
+        if let existing = await link.channel { return existing }
+        let channel = Channel(link: link) { [weak self] packet in
+            guard let self else { return }
+            try await self.sendPacket(packet)
+        }
+        await link.attachChannel(channel)
+        return channel
     }
 
     // MARK: - Outgoing Announces
