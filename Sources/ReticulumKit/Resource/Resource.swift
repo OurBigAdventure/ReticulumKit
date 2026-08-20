@@ -7,8 +7,8 @@
 // assembled stream, strips the random prefix, and proves with
 // SHA-256(plaintext + resource_hash).
 //
-// Deferred follow-ups: bz2 auto-compress (RK-12), dedicated HMU coverage (RK-13),
-// multi-segment size splits (RK-14), response Resources (RK-16).
+// Deferred follow-ups: bz2 auto-compress (RK-12), multi-segment size splits (RK-14),
+// response Resources (RK-16).
 
 import Foundation
 import CryptoKit
