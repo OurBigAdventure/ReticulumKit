@@ -52,6 +52,8 @@ public actor Link {
     private var lastActivityAt: Date = Date()
     private var keepaliveInterval: TimeInterval = LinkConstants.defaultKeepalive
     public private(set) var teardownReason: TeardownReason?
+    /// Responder: identity learned from an incoming `linkIdentify` packet.
+    public private(set) var remoteIdentity: Identity?
 
     /// Test-accessible property: true if ephemeral private key is still held.
     public var hasEphemeralKey: Bool {
@@ -661,14 +663,14 @@ public actor Link {
 
     // MARK: - Identify
 
-    /// Create an identify packet containing this node's identity hash.
+    /// Identify to the peer (Python `Link.identify`): Ed25519 public key + signature over link_id.
     ///
-    /// Used by LXMF propagation clients to identify themselves to a propagation node
-    /// after link establishment. The identity hash is encrypted with the link Token
-    /// and sent as a link-addressed data packet with `.linkIdentify` context.
+    /// Packs `signing_public_key (32) || signature (64)` where the signature covers
+    /// `link_id || signing_public_key`, encrypts with the link Token, and returns a
+    /// link-addressed DATA packet with `.linkIdentify` context.
     ///
-    /// - Parameter identity: The identity whose hash to send.
-    /// - Returns: A packet ready to send via Transport.sendPacket.
+    /// - Parameter identity: The local identity to present to the peer.
+    /// - Returns: A packet ready to send via Transport.
     /// - Throws: If the link is not active or has no Token.
     public func identify(identity: Identity) throws -> Packet {
         guard status == .active else {
@@ -678,7 +680,10 @@ public actor Link {
             throw ReticulumError.linkNoToken
         }
 
-        let encrypted = try token.encrypt(identity.hash.data)
+        let signedData = linkId.data + identity.signingPublicKey.rawRepresentation
+        let signature = try identity.sign(signedData)
+        let proofData = identity.signingPublicKey.rawRepresentation + signature
+        let encrypted = try token.encrypt(proofData)
 
         let header = PacketHeader(
             headerType: .type1,
@@ -693,6 +698,40 @@ public actor Link {
             context: .linkIdentify,
             data: encrypted
         )
+    }
+
+    /// Parse and verify an incoming identify packet; returns the peer signing public key.
+    ///
+    /// Only the responder on an active link accepts identify. Decrypts the Token payload,
+    /// checks length (≥ 96 bytes), and verifies Ed25519 over `link_id || pubKey`.
+    ///
+    /// - Parameter packet: Inbound `.linkIdentify` packet.
+    /// - Returns: 32-byte Ed25519 signing public key, or `nil` if not applicable / invalid.
+    public func verifiedIdentifyPublicKey(from packet: Packet) async throws -> Data? {
+        guard side == .responder, status == .active else { return nil }
+        let decrypted = try decrypt(packet.data)
+        guard decrypted.count >= 96 else { return nil }
+        let pubKey = Data(decrypted.prefix(32))
+        let signature = Data(decrypted.dropFirst(32).prefix(64))
+        let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: pubKey)
+        let signed = linkId.data + pubKey
+        guard signingKey.isValidSignature(signature, for: signed) else { return nil }
+        return pubKey
+    }
+
+    /// Attach a resolved peer identity after identify (Python `Link.handle_identify`).
+    public func setRemoteIdentity(_ identity: Identity?) {
+        remoteIdentity = identity
+    }
+
+    /// Process peer identify on the responder (Python `Link.handle_identify`).
+    ///
+    /// Verifies the identify packet, then looks up a full `Identity` via the provided
+    /// callback (typically keyed by Ed25519 signing public key) and stores it as
+    /// `remoteIdentity`.
+    public func handleIncomingIdentify(_ packet: Packet, lookupIdentity: (Data) async -> Identity?) async throws {
+        guard let pubKey = try await verifiedIdentifyPublicKey(from: packet) else { return }
+        remoteIdentity = await lookupIdentity(pubKey)
     }
 
     // MARK: - Activity Tracking
