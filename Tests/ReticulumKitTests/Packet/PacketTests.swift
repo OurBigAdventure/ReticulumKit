@@ -79,6 +79,25 @@ struct PacketType1Tests {
         #expect(unpacked.data == Data([0xFF, 0xFE]))
     }
 
+    @Test("incrementingHops increases header hops by one")
+    func incrementingHops() throws {
+        let header = PacketHeader(
+            headerType: .type1,
+            propagationType: .broadcast,
+            destinationType: .plain,
+            packetType: .data,
+            hops: 2
+        )
+        let packet = Packet(
+            header: header,
+            destinationHash: makeHash(0x11),
+            context: .none,
+            data: Data([0x01])
+        )
+        #expect(packet.incrementingHops().header.hops == 3)
+        #expect(packet.header.hops == 2)
+    }
+
     @Test("Type 1 with empty data is valid (minimum header-only packet)")
     func type1EmptyData() throws {
         let header = PacketHeader(

@@ -207,10 +207,11 @@ public actor Transport {
     ///   - raw: Raw wire-format bytes.
     ///   - interface: The interface the packet arrived on.
     private func processIncomingPacket(_ raw: Data, from interface: any NetworkInterface) async {
-        guard let packet = try? Packet.unpack(raw) else {
+        guard var packet = try? Packet.unpack(raw) else {
             logger.warning("Failed to unpack packet from \(interface.interfaceId)")
             return
         }
+        packet = packet.incrementingHops()
 
         logger.info("rx: type=\(packet.header.packetType) ctx=\(packet.context) dstType=\(packet.header.destinationType) dst=\(packet.destinationHash.data.prefix(4).hexEncodedString) bytes=\(raw.count) iface=\(interface.interfaceId)")
 

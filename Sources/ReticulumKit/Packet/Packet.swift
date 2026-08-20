@@ -37,6 +37,27 @@ public struct Packet: Sendable, Equatable {
         self.data = data
     }
 
+    /// Copy with hop count increased by one (Python `Transport.inbound`: `packet.hops += 1`).
+    public func incrementingHops() -> Packet {
+        let hops = header.hops == UInt8.max ? header.hops : header.hops + 1
+        let newHeader = PacketHeader(
+            ifacFlag: header.ifacFlag,
+            headerType: header.headerType,
+            contextFlag: header.contextFlag,
+            propagationType: header.propagationType,
+            destinationType: header.destinationType,
+            packetType: header.packetType,
+            hops: hops
+        )
+        return Packet(
+            header: newHeader,
+            destinationHash: destinationHash,
+            transportId: transportId,
+            context: context,
+            data: data
+        )
+    }
+
     /// Pack into wire format bytes.
     ///
     /// - Throws: `ReticulumError.missingTransportId` if header type 2 but no transport ID.
