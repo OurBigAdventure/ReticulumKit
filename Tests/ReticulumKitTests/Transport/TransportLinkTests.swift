@@ -250,4 +250,56 @@ struct TransportLinkTests {
 
         return (transportA, transportB, mockA, mockB, link)
     }
+
+    @Test("Resource transfers a payload larger than one link packet")
+    func resourceTransferRoundTrip() async throws {
+        let (transportA, transportB, mockA, mockB, linkA) = try await setupEstablishedLink()
+        let linkId = await linkA.linkId
+        let linkB = await transportB.link(for: linkId)
+        #expect(linkB != nil)
+        #expect(await linkA.status == .active)
+        #expect(await linkB?.status == .active)
+
+        final class Box: @unchecked Sendable {
+            var received: Data?
+        }
+        let box = Box()
+        await transportB.onIncomingResource { data, _ in
+            box.received = data
+        }
+
+        let payload = Data(repeating: 0x5A, count: 2_400)
+        var lastA = await mockA.sentPackets.count
+        var lastB = await mockB.sentPackets.count
+        var spins = 0
+        final class Flag: @unchecked Sendable {
+            var done = false
+        }
+        let flag = Flag()
+        let sendTask = Task {
+            defer { flag.done = true }
+            try await transportA.sendResource(on: linkA, plaintext: payload, timeout: 15)
+        }
+        // Keep shuttling after the receiver assembles so RESOURCE_PRF reaches the sender.
+        while !flag.done && spins < 200 {
+            let sentA = await mockA.sentPackets
+            if sentA.count > lastA {
+                for packet in sentA[lastA..<sentA.count] {
+                    await mockB.feedPacket(packet)
+                }
+                lastA = sentA.count
+            }
+            let sentB = await mockB.sentPackets
+            if sentB.count > lastB {
+                for packet in sentB[lastB..<sentB.count] {
+                    await mockA.feedPacket(packet)
+                }
+                lastB = sentB.count
+            }
+            try await Task.sleep(for: .milliseconds(25))
+            spins += 1
+        }
+        try await sendTask.value
+        #expect(box.received == payload)
+    }
 }

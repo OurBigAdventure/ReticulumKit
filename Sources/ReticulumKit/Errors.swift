@@ -28,4 +28,6 @@ public enum ReticulumError: Error, Sendable {
     case linkInvalidProof(String)
     case linkRequestTooShort(Int)
     case linkNoToken
+    /// Resource transfer failed, timed out, or was rejected/corrupt.
+    case resourceFailed(String)
 }

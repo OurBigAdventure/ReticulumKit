@@ -8,6 +8,7 @@
 import Foundation
 import CryptoKit
 import Logging
+import MessagePack
 
 /// Central coordinator that wires network interfaces to announce handling and routing.
 ///
@@ -73,6 +74,12 @@ public actor Transport {
 
     /// Callbacks for validated incoming announces.
     private var announceCallbacks: [@Sendable (AnnounceResult) async -> Void] = []
+
+    /// Incoming assembled resource payload (receiver side).
+    private var incomingResourceCallback: (@Sendable (Data, Link) async -> Void)?
+
+    /// Outgoing resource reached COMPLETE (initiator side).
+    private var outgoingResourceCallback: (@Sendable (Resource, Link) async -> Void)?
 
     /// Logger for transport events.
     private let logger = Logger(label: "reticulumkit.transport")
@@ -158,6 +165,16 @@ public actor Transport {
         announceCallbacks.append(callback)
     }
 
+    /// Called when an incoming resource has been assembled (plaintext payload).
+    public func onIncomingResource(_ callback: @escaping @Sendable (Data, Link) async -> Void) {
+        incomingResourceCallback = callback
+    }
+
+    /// Called when an outgoing resource transfer completes.
+    public func onOutgoingResource(_ callback: @escaping @Sendable (Resource, Link) async -> Void) {
+        outgoingResourceCallback = callback
+    }
+
     // MARK: - Interface Status
 
     /// Return the current status of all registered interfaces.
@@ -225,6 +242,8 @@ public actor Transport {
         case .proof:
             if packet.context == .lrProof {
                 await handleLinkProof(raw, packet: packet, from: interface)
+            } else if packet.context == .resourcePRF {
+                await handleResourceProof(packet)
             } else if let proofCallback {
                 await proofCallback(packet)
             } else {
@@ -594,6 +613,37 @@ public actor Transport {
                 activeLinks.removeValue(forKey: linkId)
                 logger.info("Link \(linkId.data.prefix(4).hexEncodedString) closed by peer")
 
+            case .resourceAdv:
+                await handleResourceAdvertisement(packet, link: link)
+            case .resourceReq:
+                await handleResourceRequest(packet, link: link)
+            case .resourceHMU:
+                await handleResourceHashmapUpdate(packet, link: link)
+            case .resource:
+                for resource in await link.incomingResourceList() {
+                    await resource.receivePart(packet.data)
+                    if await resource.status == .complete, let data = await resource.assembledData {
+                        await incomingResourceCallback?(data, link)
+                        await link.removeResource(hash: await resource.hash, outgoing: false)
+                    }
+                }
+            case .resourceICL:
+                if let plaintext = try? await link.decrypt(packet.data) {
+                    let hash = Data(plaintext.prefix(ResourceConstants.identityHashLength))
+                    if let resource = await link.incomingResource(hash: hash) {
+                        await resource.cancel()
+                        await link.removeResource(hash: hash, outgoing: false)
+                    }
+                }
+            case .resourceRCL:
+                if let plaintext = try? await link.decrypt(packet.data) {
+                    let hash = Data(plaintext.prefix(ResourceConstants.identityHashLength))
+                    if let resource = await link.outgoingResource(hash: hash) {
+                        await resource.cancel(rejected: true)
+                        await link.removeResource(hash: hash, outgoing: true)
+                    }
+                }
+
             default:
                 if let linkDataCallback {
                     await linkDataCallback(packet, link)
@@ -603,6 +653,95 @@ public actor Transport {
             }
         } catch {
             logger.warning("Failed to handle link data: \(error)")
+        }
+    }
+
+    // MARK: - Resources
+
+    /// Send `plaintext` as an RNS Resource on an active link and wait until the
+    /// peer proves the transfer (Python `RNS.Resource`).
+    public func sendResource(
+        on link: Link,
+        plaintext: Data,
+        timeout: TimeInterval = 120,
+        autoCompress: Bool = false
+    ) async throws {
+        let resource = try await Resource.outgoing(
+            plaintext: plaintext,
+            link: link,
+            sendPacket: { [weak self] packet in
+                guard let self else { return }
+                try await self.sendPacket(packet)
+            },
+            autoCompress: autoCompress
+        )
+        await link.registerOutgoingResource(resource)
+        try await resource.advertise()
+        try await resource.waitUntilComplete(timeout: timeout)
+        await link.removeResource(hash: await resource.hash, outgoing: true)
+    }
+
+    private func handleResourceAdvertisement(_ packet: Packet, link: Link) async {
+        guard let plaintext = try? await link.decrypt(packet.data),
+              let advertisement = try? ResourceAdvertisement.unpack(plaintext) else {
+            logger.warning("Invalid resource advertisement")
+            return
+        }
+        let resource = await Resource.incoming(advertisement: advertisement, link: link) { [weak self] packet in
+            guard let self else { return }
+            try await self.sendPacket(packet)
+        }
+        await link.registerIncomingResource(resource)
+        logger.info("resource incoming hash=\(advertisement.hash.prefix(4).hexEncodedString) parts=\(advertisement.partCount)")
+        await resource.requestNext()
+    }
+
+    private func handleResourceRequest(_ packet: Packet, link: Link) async {
+        guard let plaintext = try? await link.decrypt(packet.data) else { return }
+        let hashOffset: Int
+        if plaintext.first == ResourceConstants.hashmapExhausted {
+            hashOffset = 1 + ResourceConstants.mapHashLength
+        } else {
+            hashOffset = 1
+        }
+        guard plaintext.count >= hashOffset + ResourceConstants.identityHashLength else { return }
+        let hash = Data(plaintext.dropFirst(hashOffset).prefix(ResourceConstants.identityHashLength))
+        if let resource = await link.outgoingResource(hash: hash) {
+            await resource.handleRequest(plaintext)
+        }
+    }
+
+    private func handleResourceHashmapUpdate(_ packet: Packet, link: Link) async {
+        guard let plaintext = try? await link.decrypt(packet.data),
+              plaintext.count > ResourceConstants.identityHashLength else { return }
+        let hash = Data(plaintext.prefix(ResourceConstants.identityHashLength))
+        let rest = Data(plaintext.dropFirst(ResourceConstants.identityHashLength))
+        guard let decoded = try? MessagePackDecoder().decode(HashmapUpdateWire.self, from: rest) else { return }
+        if let resource = await link.incomingResource(hash: hash) {
+            await resource.hashmapUpdate(segment: decoded.segment, hashmapBytes: decoded.hashmap)
+        }
+    }
+
+    private func handleResourceProof(_ packet: Packet) async {
+        guard let link = activeLinks[packet.destinationHash] else { return }
+        let hash = Data(packet.data.prefix(ResourceConstants.identityHashLength))
+        if let resource = await link.outgoingResource(hash: hash) {
+            await resource.validateProof(packet.data)
+            if await resource.status == .complete {
+                await outgoingResourceCallback?(resource, link)
+                await link.removeResource(hash: hash, outgoing: true)
+            }
+        }
+    }
+
+    private struct HashmapUpdateWire: Decodable {
+        let segment: Int
+        let hashmap: Data
+
+        init(from decoder: Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            self.segment = try container.decode(Int.self)
+            self.hashmap = try container.decode(Data.self)
         }
     }
 
