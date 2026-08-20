@@ -9,6 +9,7 @@
 import Foundation
 import CryptoKit
 import CommonCrypto
+import CMonocypher
 
 internal enum CryptoEngine {
 
@@ -144,8 +145,34 @@ internal enum CryptoEngine {
     // MARK: - Ed25519
 
     /// Sign data with Ed25519 private key. Returns 64-byte signature.
+    ///
+    /// Apple CryptoKit uses hedged (randomized) Ed25519. Packet proofs still
+    /// verify, but Python IFAC re-signs and compares a signature suffix, which
+    /// requires RFC 8032 deterministic signatures — use `signRFC8032`.
     static func sign(_ message: Data, with privateKey: Curve25519.Signing.PrivateKey) throws -> Data {
         try privateKey.signature(for: message)
+    }
+
+    /// RFC 8032 Ed25519 sign (PyNaCl / Python RNS). Deterministic.
+    ///
+    /// - Parameters:
+    ///   - message: Message bytes.
+    ///   - seed: 32-byte Ed25519 seed (`Signing.PrivateKey.rawRepresentation`).
+    static func signRFC8032(_ message: Data, seed: Data) throws -> Data {
+        guard seed.count == 32 else {
+            throw ReticulumError.invalidKeySize(seed.count)
+        }
+        var secretKey = [UInt8](repeating: 0, count: 64)
+        var publicKey = [UInt8](repeating: 0, count: 32)
+        var seedBytes = [UInt8](seed)
+        crypto_ed25519_key_pair(&secretKey, &publicKey, &seedBytes)
+        var signature = [UInt8](repeating: 0, count: 64)
+        message.withUnsafeBytes { rawBuffer in
+            let ptr = rawBuffer.bindMemory(to: UInt8.self).baseAddress
+            crypto_ed25519_sign(&signature, secretKey, ptr, message.count)
+        }
+        for i in secretKey.indices { secretKey[i] = 0 }
+        return Data(signature)
     }
 
     /// Verify Ed25519 signature against a public key.

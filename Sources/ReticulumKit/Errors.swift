@@ -28,4 +28,6 @@ public enum ReticulumError: Error, Sendable {
     case linkInvalidProof(String)
     case linkRequestTooShort(Int)
     case linkNoToken
+    /// IFAC identity derivation failed (missing network name / passphrase).
+    case ifacMisconfigured(String)
 }

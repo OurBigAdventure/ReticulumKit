@@ -91,6 +91,18 @@ struct IdentityTests {
         #expect(identity.verify(signature: signature, for: message) == true)
     }
 
+    @Test("RFC 8032 Ed25519 is deterministic and verifies with CryptoKit")
+    func rfc8032Deterministic() throws {
+        let identity = Identity()
+        let message = Data("ifac-compat".utf8)
+        let seed = Data(identity.signingPrivateKey.rawRepresentation)
+        let a = try CryptoEngine.signRFC8032(message, seed: seed)
+        let b = try CryptoEngine.signRFC8032(message, seed: seed)
+        #expect(a == b)
+        #expect(a.count == IdentityConstants.sigLength)
+        #expect(identity.verify(signature: a, for: message) == true)
+    }
+
     @Test("Identity.verify rejects tampered message")
     func verifyRejectsTampered() throws {
         let identity = Identity()

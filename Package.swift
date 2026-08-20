@@ -13,8 +13,14 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CMonocypher",
+            publicHeadersPath: "include",
+            cSettings: [.headerSearchPath("include")]
+        ),
+        .target(
             name: "ReticulumKit",
             dependencies: [
+                "CMonocypher",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "DMMessagePack", package: "msgpack-swift"),
             ]

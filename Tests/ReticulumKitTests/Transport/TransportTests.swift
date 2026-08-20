@@ -184,4 +184,31 @@ struct TransportTests {
         #expect(entry?.publicKey == identity.publicKeyBytes)
         #expect(entry?.destinationHash == destination.hash)
     }
+
+    @Test("IFAC wrap on egress; non-IFAC interface drops IFAC-flagged packets")
+    func ifacEgressAndNonIfacDrop() async throws {
+        let ifac = try InterfaceAccessCode(networkName: "private-mesh", passphrase: "secret")
+        let transportIFAC = Transport()
+        let mockIFAC = MockTransportInterface(id: "ifac-iface")
+        await transportIFAC.addInterface(mockIFAC, accessCode: ifac)
+
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "ifac.app", aspects: ["msg"])
+        await transportIFAC.registerDestination(destination, identity: identity)
+        try await transportIFAC.sendAnnounce(for: destination)
+
+        let sent = await mockIFAC.sentPackets
+        #expect(sent.count == 1)
+        #expect(sent[0][sent[0].startIndex] & 0x80 == 0x80)
+        #expect(ifac.unwrap(sent[0]) != nil)
+
+        // Same IFAC-wrapped frame on a non-IFAC interface must be dropped.
+        let transportPlain = Transport()
+        let mockPlain = MockTransportInterface(id: "plain-iface")
+        await transportPlain.addInterface(mockPlain)
+        await mockPlain.feedPacket(sent[0])
+        try await Task.sleep(for: .milliseconds(200))
+        let entry = await transportPlain.routingTable.lookup(destination.hash)
+        #expect(entry == nil)
+    }
 }

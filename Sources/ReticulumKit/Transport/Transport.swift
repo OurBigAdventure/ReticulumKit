@@ -74,6 +74,9 @@ public actor Transport {
     /// Callbacks for validated incoming announces.
     private var announceCallbacks: [@Sendable (AnnounceResult) async -> Void] = []
 
+    /// Optional IFAC per interface id (Python `network_name` / `passphrase`).
+    private var interfaceAccessCodes: [String: InterfaceAccessCode] = [:]
+
     /// Logger for transport events.
     private let logger = Logger(label: "reticulumkit.transport")
 
@@ -89,10 +92,15 @@ public actor Transport {
     /// iterates the interface's incoming packet stream, dispatching each packet
     /// to `processIncomingPacket`.
     ///
-    /// - Parameter interface: The network interface to add.
-    public func addInterface(_ interface: any NetworkInterface) async {
+    /// - Parameters:
+    ///   - interface: The network interface to add.
+    ///   - accessCode: Optional IFAC for this interface (Python `network_name` / `passphrase`).
+    public func addInterface(_ interface: any NetworkInterface, accessCode: InterfaceAccessCode? = nil) async {
         interfaces.append(interface)
         rateLimiters[interface.interfaceId] = AnnounceRateLimiter(bitrate: interface.bitrate)
+        if let accessCode {
+            interfaceAccessCodes[interface.interfaceId] = accessCode
+        }
 
         let task = Task { [weak self] in
             for await raw in interface.incomingPackets {
@@ -114,6 +122,7 @@ public actor Transport {
         interfaceListenerTasks[id]?.cancel()
         interfaceListenerTasks.removeValue(forKey: id)
         rateLimiters.removeValue(forKey: id)
+        interfaceAccessCodes.removeValue(forKey: id)
         interfaces.removeAll { $0.interfaceId == id }
     }
 
@@ -178,6 +187,15 @@ public actor Transport {
 
     // MARK: - Packet Sending
 
+    /// Wrap with IFAC when configured, then send on one interface.
+    private func sendOnInterface(_ interface: any NetworkInterface, packed: Data) async throws {
+        var wire = packed
+        if let ifac = interfaceAccessCodes[interface.interfaceId] {
+            wire = try ifac.wrap(packed)
+        }
+        try await interface.send(wire)
+    }
+
     /// Send a packet through all online interfaces.
     ///
     /// - Parameter packet: The packet to send.
@@ -188,7 +206,7 @@ public actor Transport {
             let isOnline = await interface.isOnline
             guard isOnline else { continue }
             do {
-                try await interface.send(packedData)
+                try await sendOnInterface(interface, packed: packedData)
             } catch {
                 logger.warning("Failed to send packet on \(interface.interfaceId): \(error)")
             }
@@ -207,7 +225,15 @@ public actor Transport {
     ///   - raw: Raw wire-format bytes.
     ///   - interface: The interface the packet arrived on.
     private func processIncomingPacket(_ raw: Data, from interface: any NetworkInterface) async {
-        guard let packet = try? Packet.unpack(raw) else {
+        var payload = raw
+        if let ifac = interfaceAccessCodes[interface.interfaceId] {
+            guard let unwrapped = ifac.unwrap(raw) else { return }
+            payload = unwrapped
+        } else if raw.count > 0, raw[raw.startIndex] & 0x80 == 0x80 {
+            // IFAC flag set on a non-IFAC interface — drop (Python Transport.inbound).
+            return
+        }
+        guard let packet = try? Packet.unpack(payload) else {
             logger.warning("Failed to unpack packet from \(interface.interfaceId)")
             return
         }
@@ -221,10 +247,10 @@ public actor Transport {
             // so path responses are validated identically and inserted into routing table.
             await handleAnnounce(packet, from: interface)
         case .linkRequest:
-            await handleLinkRequest(raw, packet: packet, from: interface)
+            await handleLinkRequest(payload, packet: packet, from: interface)
         case .proof:
             if packet.context == .lrProof {
-                await handleLinkProof(raw, packet: packet, from: interface)
+                await handleLinkProof(payload, packet: packet, from: interface)
             } else if let proofCallback {
                 await proofCallback(packet)
             } else {
@@ -278,7 +304,7 @@ public actor Transport {
                 data: basePacket.data
             )
             let packedData = try response.pack()
-            try await interface.send(packedData)
+            try await sendOnInterface(interface, packed: packedData)
             logger.info("path request: replied for local \(targetHex) on \(interface.interfaceId) (\(packedData.count) bytes)")
         } catch {
             logger.warning("path request: failed to build response for \(targetHex): \(error)")
@@ -319,7 +345,7 @@ public actor Transport {
             let isOnline = await interface.isOnline
             guard isOnline else { continue }
             do {
-                try await interface.send(packedData)
+                try await sendOnInterface(interface, packed: packedData)
                 sentOn += 1
             } catch {
                 logger.warning("Failed to send path request on \(interface.interfaceId): \(error)")
@@ -419,7 +445,7 @@ public actor Transport {
                 continue
             }
             do {
-                try await interface.send(packedData)
+                try await sendOnInterface(interface, packed: packedData)
                 sentOn += 1
                 logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent on \(interface.interfaceId) (\(packedData.count) bytes)")
             } catch {
@@ -450,7 +476,7 @@ public actor Transport {
                 let isOnline = await interface.isOnline
                 guard isOnline else { continue }
                 do {
-                    try await interface.send(packedData)
+                    try await sendOnInterface(interface, packed: packedData)
                 } catch {
                     logger.warning("Failed to send teardown on \(interface.interfaceId): \(error)")
                 }
@@ -487,7 +513,7 @@ public actor Transport {
             activeLinks[linkId] = responderLink
 
             let packedProof = try proofPacket.pack()
-            try await interface.send(packedProof)
+            try await sendOnInterface(interface, packed: packedProof)
             logger.info("Link request accepted, proof sent for \(linkId.data.prefix(4).hexEncodedString)")
         } catch {
             logger.warning("Failed to respond to link request: \(error)")
@@ -555,7 +581,7 @@ public actor Transport {
                 let isOnline = await iface.isOnline
                 guard isOnline else { continue }
                 do {
-                    try await iface.send(packedRTT)
+                    try await sendOnInterface(iface, packed: packedRTT)
                 } catch {
                     logger.warning("Failed to send RTT on \(iface.interfaceId): \(error)")
                 }
@@ -586,7 +612,7 @@ public actor Transport {
                 let reply = try await link.handleKeepalive(packet: packet)
                 if let reply {
                     let packedReply = try reply.pack()
-                    try await interface.send(packedReply)
+                    try await sendOnInterface(interface, packed: packedReply)
                 }
 
             case .linkClose:
@@ -643,7 +669,7 @@ public actor Transport {
                 continue
             }
             do {
-                try await interface.send(packedData)
+                try await sendOnInterface(interface, packed: packedData)
                 await limiter?.recordSend(packetSize: packedData.count)
                 sentOn.append(interface.interfaceId)
             } catch {

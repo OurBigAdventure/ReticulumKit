@@ -1,0 +1,4 @@
+module CMonocypher {
+    umbrella header "CMonocypher.h"
+    export *
+}
