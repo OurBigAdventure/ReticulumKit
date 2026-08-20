@@ -74,12 +74,20 @@ public actor Transport {
     /// Callbacks for validated incoming announces.
     private var announceCallbacks: [@Sendable (AnnounceResult) async -> Void] = []
 
+    /// When true, outgoing announces include an ephemeral X25519 ratchet (Python `enable_ratchets`).
+    private var emitRatchetAnnounces = false
+
     /// Logger for transport events.
     private let logger = Logger(label: "reticulumkit.transport")
 
     // MARK: - Initialization
 
     public init() {}
+
+    /// Enable or disable ratchet emission on outgoing announces (default off).
+    public func setEmitRatchetAnnounces(_ enabled: Bool) {
+        emitRatchetAnnounces = enabled
+    }
 
     // MARK: - Interface Management
 
@@ -369,7 +377,8 @@ public actor Transport {
             appData: result.appData,
             hops: packet.header.hops,
             timestamp: Date(),
-            interfaceId: interface.interfaceId
+            interfaceId: interface.interfaceId,
+            ratchet: result.ratchet
         )
 
         await routingTable.addEntry(entry)
@@ -618,9 +627,13 @@ public actor Transport {
     ///   - appData: Optional app data (falls back to registered app data).
     /// - Throws: If announce creation or packing fails.
     public func sendAnnounce(for destination: Destination, appData: Data? = nil) async throws {
+        let ratchet: Data? = emitRatchetAnnounces
+            ? Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+            : nil
         let packet = try Announce.create(
             destination: destination,
-            appData: appData ?? localAppData[destination.hash]
+            appData: appData ?? localAppData[destination.hash],
+            ratchet: ratchet
         )
         let packedData = try packet.pack()
         let destHex = destination.hash.data.prefix(4).hexEncodedString

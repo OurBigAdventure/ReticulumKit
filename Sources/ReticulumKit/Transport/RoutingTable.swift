@@ -23,6 +23,28 @@ public struct RouteEntry: Sendable {
     public let timestamp: Date
     /// Identifier of the interface this announce arrived on
     public let interfaceId: String
+    /// Optional 32-byte X25519 ratchet public key from a context_flag announce.
+    public let ratchet: Data?
+
+    public init(
+        destinationHash: TruncatedHash,
+        publicKey: Data,
+        nameHash: Data,
+        appData: Data?,
+        hops: UInt8,
+        timestamp: Date,
+        interfaceId: String,
+        ratchet: Data? = nil
+    ) {
+        self.destinationHash = destinationHash
+        self.publicKey = publicKey
+        self.nameHash = nameHash
+        self.appData = appData
+        self.hops = hops
+        self.timestamp = timestamp
+        self.interfaceId = interfaceId
+        self.ratchet = ratchet
+    }
 }
 
 /// Actor-isolated routing table for thread-safe access from multiple interfaces.

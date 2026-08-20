@@ -139,6 +139,24 @@ struct IdentityTests {
         #expect(try bob.decrypt(ciphertext: c2) == plaintext)
     }
 
+    @Test("Encrypt with a ratchet public key is not decryptable with the static identity")
+    func encryptWithRatchetDiffersFromStatic() throws {
+        let alice = Identity()
+        let bob = Identity()
+        let ratchet = Curve25519.KeyAgreement.PrivateKey()
+        let plaintext = Data("ratchet".utf8)
+        let withRatchet = try alice.encrypt(
+            plaintext: plaintext,
+            for: bob,
+            ratchetPublicKey: Data(ratchet.publicKey.rawRepresentation)
+        )
+        #expect(throws: (any Error).self) {
+            try bob.decrypt(ciphertext: withRatchet)
+        }
+        let staticCipher = try alice.encrypt(plaintext: plaintext, for: bob)
+        #expect(try bob.decrypt(ciphertext: staticCipher) == plaintext)
+    }
+
     @Test("Identity decrypt rejects tampered ciphertext via HMAC")
     func decryptRejectsTamperedCiphertext() throws {
         let alice = Identity()

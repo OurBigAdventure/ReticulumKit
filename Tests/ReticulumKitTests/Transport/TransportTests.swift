@@ -3,6 +3,7 @@
 
 import Testing
 import Foundation
+import CryptoKit
 @testable import ReticulumKit
 
 // MARK: - Mock NetworkInterface for Transport testing
@@ -183,5 +184,51 @@ struct TransportTests {
         #expect(entry != nil)
         #expect(entry?.publicKey == identity.publicKeyBytes)
         #expect(entry?.destinationHash == destination.hash)
+    }
+
+    @Test("inbound announce with ratchet stores RouteEntry.ratchet")
+    func storesAnnounceRatchet() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "iface-ratchet")
+        await transport.addInterface(mock)
+
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "test.app", aspects: ["messaging"])
+        let ratchet = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+        let announcePacket = try Announce.create(destination: destination, ratchet: ratchet)
+        await mock.feedPacket(try announcePacket.pack())
+        try await Task.sleep(for: .milliseconds(200))
+
+        let entry = await transport.routingTable.lookup(destination.hash)
+        #expect(entry?.ratchet == ratchet)
+    }
+
+    @Test("sendAnnounce omits ratchet by default; emits when setEmitRatchetAnnounces(true)")
+    func emitRatchetAnnouncesToggle() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "iface-emit")
+        await transport.addInterface(mock)
+
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "test.app", aspects: ["messaging"])
+        await transport.registerDestination(destination)
+
+        try await transport.sendAnnounce(for: destination)
+        let defaultPacked = await mock.sentPackets
+        #expect(defaultPacked.count == 1)
+        let defaultPacket = try Packet.unpack(defaultPacked[0])
+        #expect(defaultPacket.header.contextFlag == false)
+        #expect(try Announce.validate(packet: defaultPacket).ratchet == nil)
+
+        await transport.setEmitRatchetAnnounces(true)
+        // Drain rate limiter by using a fresh interface with high bitrate.
+        let mock2 = MockTransportInterface(id: "iface-emit-2", bitrate: 10_000_000)
+        await transport.addInterface(mock2)
+        try await transport.sendAnnounce(for: destination)
+        let enabledPacked = await mock2.sentPackets
+        #expect(enabledPacked.count == 1)
+        let enabledPacket = try Packet.unpack(enabledPacked[0])
+        #expect(enabledPacket.header.contextFlag == true)
+        #expect(try Announce.validate(packet: enabledPacket).ratchet?.count == 32)
     }
 }

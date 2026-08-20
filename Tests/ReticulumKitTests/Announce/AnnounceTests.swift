@@ -3,6 +3,7 @@
 
 import Testing
 import Foundation
+import CryptoKit
 @testable import ReticulumKit
 
 @Suite("Announce creation and validation")
@@ -143,6 +144,29 @@ struct AnnounceTests {
         #expect(result.ratchet == nil)
         #expect(result.publicKey == identity.publicKeyBytes)
         #expect(result.nameHash == destination.nameHash)
+    }
+
+    @Test("create -> validate round-trip with ratchet")
+    func createValidateRoundTripWithRatchet() throws {
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
+        let ratchet = Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation
+        let packet = try Announce.create(destination: destination, ratchet: ratchet)
+        #expect(packet.header.contextFlag == true)
+        #expect(packet.data.count == 180)
+        let result = try Announce.validate(packet: packet)
+        #expect(result.ratchet == ratchet)
+        #expect(result.destinationHash == destination.hash)
+    }
+
+    @Test("create rejects ratchet with wrong length")
+    func createRejectsInvalidRatchet() throws {
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "test", aspects: ["app"])
+        let badRatchet = Data(repeating: 0x01, count: 16)
+        #expect(throws: AnnounceError.invalidRatchet) {
+            try Announce.create(destination: destination, ratchet: badRatchet)
+        }
     }
 
     @Test("randomHash trailing 5 bytes encode current Unix timestamp big-endian")

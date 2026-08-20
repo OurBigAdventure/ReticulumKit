@@ -130,21 +130,31 @@ public struct Identity: Sendable {
     /// be reconstructed. Pass a verification-only Identity (constructed via
     /// `init(publicKeyBytes:)`) when only public keys are known.
     ///
-    /// Note: this is the "no ratchet" path. Per-destination ratchet keys are not yet
-    /// supported in Swift; modern peers that don't enforce ratchets fall back to the
-    /// destination's static identity key, which this implementation matches.
+    /// Note: when `ratchetPublicKey` is nil this is the static-identity path.
+    /// When set, ECDH uses that announce ratchet (Python `Identity.encrypt` ratchet=).
     ///
     /// - Parameters:
     ///   - plaintext: Data to encrypt.
     ///   - recipient: The recipient's identity (public-key form is sufficient).
+    ///   - ratchetPublicKey: Optional 32-byte X25519 ratchet pub from their announce.
+    ///     Python `Identity.encrypt(..., ratchet=)` ECDHs against this key when set;
+    ///     HKDF salt remains the recipient identity hash.
     /// - Returns: Encrypted token in Reticulum wire format.
-    public func encrypt(plaintext: Data, for recipient: Identity) throws -> Data {
+    public func encrypt(plaintext: Data, for recipient: Identity, ratchetPublicKey: Data? = nil) throws -> Data {
         let ephemeralPrivateKey = Curve25519.KeyAgreement.PrivateKey()
         let ephemeralPubBytes = Data(ephemeralPrivateKey.publicKey.rawRepresentation)
 
+        let agreementKey: Curve25519.KeyAgreement.PublicKey
+        if let ratchetPublicKey, ratchetPublicKey.count == 32,
+           let ratchetKey = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ratchetPublicKey) {
+            agreementKey = ratchetKey
+        } else {
+            agreementKey = recipient.agreementPublicKey
+        }
+
         let sharedSecret = try CryptoEngine.keyAgreement(
             privateKey: ephemeralPrivateKey,
-            publicKey: recipient.agreementPublicKey
+            publicKey: agreementKey
         )
         let derivedKey = CryptoEngine.hkdf(
             length: 64,

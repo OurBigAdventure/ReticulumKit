@@ -55,6 +55,8 @@ public struct AnnounceResult: Sendable {
 public enum AnnounceError: Error, Sendable {
     /// Packet data is shorter than the minimum 148 bytes
     case tooShort
+    /// Ratchet field is present but not exactly 32 bytes
+    case invalidRatchet
     /// Reconstructed destination hash does not match packet destination hash
     case destinationHashMismatch
     /// Ed25519 signature verification failed
@@ -81,16 +83,17 @@ public enum Announce {
 
     /// Create a signed announce packet for a destination.
     ///
-    /// Produces a Python-RNS-compatible announce with no ratchet field
-    /// (context_flag = 0). Wire-format-verified against canonical Python
-    /// Reticulum 1.x / 2.x peers (Sideband, MeshChat, Columba, nomadnet).
+    /// Produces a Python-RNS-compatible announce. When `ratchet` is a 32-byte X25519
+    /// public key, the packet uses `context_flag = 1` and includes the ratchet field.
+    /// Without a ratchet, `context_flag = 0` (default, backward compatible).
     ///
     /// - Parameters:
     ///   - destination: The destination to announce.
     ///   - appData: Optional application data to include.
+    ///   - ratchet: Optional 32-byte X25519 ratchet public key for opportunistic encrypt.
     /// - Returns: A signed announce `Packet` ready for transmission.
-    /// - Throws: If signing fails or random generation fails.
-    public static func create(destination: Destination, appData: Data? = nil) throws -> Packet {
+    /// - Throws: If signing fails, random generation fails, or `ratchet` is the wrong length.
+    public static func create(destination: Destination, appData: Data? = nil, ratchet: Data? = nil) throws -> Packet {
         let publicKey = destination.identity.publicKeyBytes  // 64 bytes
         let nameHash = destination.nameHash                  // 10 bytes
 
@@ -108,19 +111,18 @@ public enum Announce {
         tsBytes[4] = UInt8(timestamp & 0xFF)
         let randomHash = randomBytes + tsBytes  // 10 bytes total
 
-        // No ratchet support yet — context_flag = 0, ratchet field omitted.
-        // Ratchets are signed-but-not-included logic in Python; with no ratchet
-        // the signed buffer has an empty-string slot for the ratchet field.
+        if let ratchet, ratchet.count != ratchetLen {
+            throw AnnounceError.invalidRatchet
+        }
 
-        // Build signed data: destHash(16) + publicKey(64) + nameHash(10) + randomHash(10) [+ appData]
+        // Build signed data: destHash(16) + publicKey(64) + nameHash(10) + randomHash(10) [+ ratchet] [+ appData]
         // Python signs over: hash + public_key + name_hash + random_hash + ratchet + app_data
-        // where ratchet = b"" when not present, so it concatenates to the same bytes.
         var signedData = Data()
         signedData.append(destination.hash.data)  // 16 bytes
         signedData.append(publicKey)               // 64 bytes
         signedData.append(nameHash)                // 10 bytes
         signedData.append(randomHash)              // 10 bytes
-        // ratchet = empty when context_flag=0
+        if let ratchet { signedData.append(ratchet) }
         if let appData {
             signedData.append(appData)
         }
@@ -128,21 +130,21 @@ public enum Announce {
         // Sign with Ed25519
         let signature = try destination.identity.sign(signedData)  // 64 bytes
 
-        // Build payload: publicKey(64) + nameHash(10) + randomHash(10) + signature(64) [+ appData]
-        // (no ratchet bytes when context_flag=0)
+        // Build payload: publicKey(64) + nameHash(10) + randomHash(10) [+ ratchet(32)] + signature(64) [+ appData]
         var payload = Data()
         payload.append(publicKey)    // 64 bytes
         payload.append(nameHash)     // 10 bytes
         payload.append(randomHash)   // 10 bytes
+        if let ratchet { payload.append(ratchet) }
         payload.append(signature)    // 64 bytes
         if let appData {
             payload.append(appData)
         }
 
-        // Create packet header. context_flag = false (no ratchet field).
+        // Create packet header. context_flag set when ratchet is present.
         let header = PacketHeader(
             headerType: .type1,
-            contextFlag: false,
+            contextFlag: ratchet != nil,
             propagationType: .broadcast,
             destinationType: .single,
             packetType: .announce
