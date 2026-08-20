@@ -52,6 +52,20 @@ struct LinkRequestTests {
         #expect(unpacked.payload == response)
     }
 
+    @Test("binary payload helpers round-trip raw page bytes")
+    func binaryPayloadRoundTrip() {
+        let page = Data(">Hello\n".utf8)
+        let packed = LinkRequestCodec.packBinaryPayload(page)
+        #expect(LinkRequestCodec.unpackBinaryPayload(packed) == page)
+    }
+
+    @Test("string map packs NomadNet form fields")
+    func stringMapRoundTrip() {
+        let fields = ["field_user": "alice", "var_token": "xyz"]
+        let packed = LinkRequestCodec.packStringMap(fields)
+        #expect(LinkRequestCodec.unpackStringMap(packed) == fields)
+    }
+
     @Test("matches Python-generated fixture bytes")
     func pythonFixture() throws {
         let url = Bundle.module.url(

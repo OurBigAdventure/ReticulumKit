@@ -53,6 +53,11 @@ public actor Link {
     private var keepaliveInterval: TimeInterval = LinkConstants.defaultKeepalive
     public private(set) var teardownReason: TeardownReason?
 
+    /// Outgoing resources keyed by 32-byte resource hash.
+    private var outgoingResources: [Data: Resource] = [:]
+    /// Incoming resources keyed by 32-byte resource hash.
+    private var incomingResources: [Data: Resource] = [:]
+
     /// Test-accessible property: true if ephemeral private key is still held.
     public var hasEphemeralKey: Bool {
         ephemeralPrivateKey != nil
@@ -693,6 +698,44 @@ public actor Link {
             context: .linkIdentify,
             data: encrypted
         )
+    }
+
+    // MARK: - Resources
+
+    /// Register an outgoing resource on this link.
+    public func registerOutgoingResource(_ resource: Resource) async {
+        let hash = await resource.hash
+        outgoingResources[hash] = resource
+    }
+
+    /// Register an incoming resource on this link.
+    public func registerIncomingResource(_ resource: Resource) async {
+        let hash = await resource.hash
+        incomingResources[hash] = resource
+    }
+
+    /// Look up an outgoing resource by hash.
+    public func outgoingResource(hash: Data) -> Resource? {
+        outgoingResources[hash]
+    }
+
+    /// Look up an incoming resource by hash.
+    public func incomingResource(hash: Data) -> Resource? {
+        incomingResources[hash]
+    }
+
+    /// Incoming resources currently transferring.
+    public func incomingResourceList() -> [Resource] {
+        Array(incomingResources.values)
+    }
+
+    /// Remove a finished resource.
+    public func removeResource(hash: Data, outgoing: Bool) {
+        if outgoing {
+            outgoingResources.removeValue(forKey: hash)
+        } else {
+            incomingResources.removeValue(forKey: hash)
+        }
     }
 
     // MARK: - Activity Tracking

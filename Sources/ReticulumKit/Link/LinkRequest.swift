@@ -50,7 +50,8 @@ public enum LinkRequestCodec {
 
     /// Pack a response: `[request_id, response_payload]`.
     ///
-    /// `payload` must already be a msgpack value (bin/str/array/map).
+    /// `payload` must already be a msgpack value (bin/str/array/map). Use
+    /// `packBinaryPayload` for raw page/file bytes.
     public static func packResponse(requestId: Data, payload: Data) -> Data {
         var out = Data()
         out.append(0x92)
@@ -72,7 +73,138 @@ public enum LinkRequestCodec {
         return (requestId, Data(bytes[pos..<end]))
     }
 
+    /// Wrap raw bytes as a msgpack bin value (NomadNet page/file bodies).
+    public static func packBinaryPayload(_ data: Data) -> Data {
+        msgpackBin(data)
+    }
+
+    /// Decode a msgpack bin or UTF-8 str value into raw bytes.
+    public static func unpackBinaryPayload(_ data: Data) -> Data? {
+        let bytes = Array(data)
+        guard !bytes.isEmpty else { return nil }
+        if let (bin, _) = readBin(bytes, offset: 0) { return bin }
+        let tag = bytes[0]
+        if tag & 0xE0 == 0xA0 {
+            let len = Int(tag & 0x1F)
+            guard 1 + len <= bytes.count else { return nil }
+            return Data(bytes[1..<(1 + len)])
+        }
+        if tag == 0xD9 {
+            guard bytes.count >= 2 else { return nil }
+            let len = Int(bytes[1])
+            guard 2 + len <= bytes.count else { return nil }
+            return Data(bytes[2..<(2 + len)])
+        }
+        if tag == 0xDA {
+            guard bytes.count >= 3 else { return nil }
+            let len = Int(bytes[1]) << 8 | Int(bytes[2])
+            guard 3 + len <= bytes.count else { return nil }
+            return Data(bytes[3..<(3 + len)])
+        }
+        return nil
+    }
+
+    /// Pack a string map for NomadNet form posts (`field_*` / `var_*` keys).
+    ///
+    /// Matches Python `umsgpack.packb({str: str|bytes})` used as `Link.request` data.
+    public static func packStringMap(_ fields: [String: String]) -> Data {
+        var out = Data()
+        let count = fields.count
+        if count <= 15 {
+            out.append(0x80 | UInt8(count))
+        } else if count <= 0xFFFF {
+            out.append(0xDE)
+            out.append(UInt8((count >> 8) & 0xFF))
+            out.append(UInt8(count & 0xFF))
+        } else {
+            out.append(0xDF)
+            out.append(UInt8((count >> 24) & 0xFF))
+            out.append(UInt8((count >> 16) & 0xFF))
+            out.append(UInt8((count >> 8) & 0xFF))
+            out.append(UInt8(count & 0xFF))
+        }
+        for (key, value) in fields.sorted(by: { $0.key < $1.key }) {
+            out.append(msgpackUTF8(key))
+            out.append(msgpackUTF8(value))
+        }
+        return out
+    }
+
+    /// Unpack a msgpack string map (NomadNet form body). Non-string values are skipped.
+    public static func unpackStringMap(_ data: Data) -> [String: String]? {
+        let bytes = Array(data)
+        guard !bytes.isEmpty else { return [:] }
+        let tag = bytes[0]
+        let count: Int
+        var pos: Int
+        if tag & 0xF0 == 0x80 {
+            count = Int(tag & 0x0F)
+            pos = 1
+        } else if tag == 0xDE {
+            guard bytes.count >= 3 else { return nil }
+            count = Int(bytes[1]) << 8 | Int(bytes[2])
+            pos = 3
+        } else if tag == 0xDF {
+            guard bytes.count >= 5 else { return nil }
+            count = Int(bytes[1]) << 24 | Int(bytes[2]) << 16 | Int(bytes[3]) << 8 | Int(bytes[4])
+            pos = 5
+        } else {
+            return nil
+        }
+        var result: [String: String] = [:]
+        for _ in 0..<count {
+            guard let (keyData, afterKey) = readString(bytes, offset: pos) else { return nil }
+            pos = afterKey
+            guard let (valueData, afterValue) = readString(bytes, offset: pos) else { return nil }
+            pos = afterValue
+            if let key = String(data: keyData, encoding: .utf8),
+               let value = String(data: valueData, encoding: .utf8) {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
     // MARK: - Minimal msgpack
+
+    private static func msgpackUTF8(_ string: String) -> Data {
+        let utf8 = Data(string.utf8)
+        var out = Data()
+        let n = utf8.count
+        if n <= 31 {
+            out.append(0xA0 | UInt8(n))
+        } else if n <= 0xFF {
+            out.append(contentsOf: [0xD9, UInt8(n)])
+        } else {
+            out.append(0xDA)
+            out.append(UInt8((n >> 8) & 0xFF))
+            out.append(UInt8(n & 0xFF))
+        }
+        out.append(utf8)
+        return out
+    }
+
+    private static func readString(_ bytes: [UInt8], offset: Int) -> (Data, Int)? {
+        guard offset < bytes.count else { return nil }
+        let tag = bytes[offset]
+        var pos = offset + 1
+        let len: Int
+        if tag & 0xE0 == 0xA0 {
+            len = Int(tag & 0x1F)
+        } else if tag == 0xD9 {
+            guard pos < bytes.count else { return nil }
+            len = Int(bytes[pos]); pos += 1
+        } else if tag == 0xDA {
+            guard pos + 2 <= bytes.count else { return nil }
+            len = Int(bytes[pos]) << 8 | Int(bytes[pos + 1]); pos += 2
+        } else if let (bin, after) = readBin(bytes, offset: offset) {
+            return (bin, after)
+        } else {
+            return nil
+        }
+        guard pos + len <= bytes.count else { return nil }
+        return (Data(bytes[pos..<pos + len]), pos + len)
+    }
 
     private static func msgpackFloat64(_ value: Double) -> Data {
         var bits = value.bitPattern.bigEndian

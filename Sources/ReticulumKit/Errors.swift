@@ -30,4 +30,6 @@ public enum ReticulumError: Error, Sendable {
     case linkNoToken
     /// Timed out waiting for a link REQUEST response (Python `Link.request` timeout).
     case linkRequestTimeout
+    /// Resource transfer failed, timed out, or was rejected/corrupt.
+    case resourceFailed(String)
 }
