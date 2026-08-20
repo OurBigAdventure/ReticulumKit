@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 // RoutingTable.swift — Destination hash to route entry mapping
 //
-// Stores announce-derived route entries keyed by destination hash.
-// Updates only when a new entry has strictly fewer hops than the existing one.
-// Entries expire after 1 week (604,800 seconds) matching Python Reticulum.
+// Path selection matches Python RNS `Transport.inbound` announce handling
+// (`RNS/Transport.py`): prefer a more recently *emitted* announce (unix time
+// in random_hash[5..<10]), not hop count alone. A newer emission replaces an
+// existing path even when hops are worse; an older emission is ignored unless
+// the current path has expired (PATHFINDER_E = 1 week).
 
 import Foundation
 
@@ -19,10 +21,40 @@ public struct RouteEntry: Sendable {
     public let appData: Data?
     /// Number of hops to reach this destination
     public let hops: UInt8
-    /// When this route was learned
+    /// When this route was learned locally
     public let timestamp: Date
+    /// Announce emission time (unix seconds) from random_hash[5..<10].
+    public let emittedAt: UInt64
+    /// When this path should be considered stale (PATHFINDER_E).
+    public let expires: Date
     /// Identifier of the interface this announce arrived on
     public let interfaceId: String
+    /// Recent announce random_blobs for loop detection (max 64).
+    public let randomBlobs: [Data]
+
+    public init(
+        destinationHash: TruncatedHash,
+        publicKey: Data,
+        nameHash: Data,
+        appData: Data?,
+        hops: UInt8,
+        timestamp: Date,
+        interfaceId: String,
+        emittedAt: UInt64 = 0,
+        expires: Date = Date().addingTimeInterval(RoutingTable.defaultExpiry),
+        randomBlobs: [Data] = []
+    ) {
+        self.destinationHash = destinationHash
+        self.publicKey = publicKey
+        self.nameHash = nameHash
+        self.appData = appData
+        self.hops = hops
+        self.timestamp = timestamp
+        self.emittedAt = emittedAt
+        self.expires = expires
+        self.interfaceId = interfaceId
+        self.randomBlobs = randomBlobs
+    }
 }
 
 /// Actor-isolated routing table for thread-safe access from multiple interfaces.
@@ -30,44 +62,44 @@ public actor RoutingTable {
     /// Route entries keyed by destination hash
     private var entries: [TruncatedHash: RouteEntry] = [:]
 
-    /// Default entry expiry: 1 week (matches Python Reticulum)
+    /// Default entry expiry: 1 week (Python `PATHFINDER_E`).
     public static let defaultExpiry: TimeInterval = 604_800
+
+    /// Python `MAX_RANDOM_BLOBS`.
+    public static let maxRandomBlobs = 64
 
     public init() {}
 
-    /// Add or update a route entry.
+    /// Add or update a route using Python announce recency rules.
     ///
-    /// Only replaces an existing entry if the new entry has strictly fewer hops.
-    /// If hops are equal or greater, the existing entry is kept.
-    ///
-    /// - Parameter entry: The route entry to add.
-    public func addEntry(_ entry: RouteEntry) {
+    /// - Returns: `true` when the table changed.
+    @discardableResult
+    public func addEntry(_ entry: RouteEntry) -> Bool {
         if let existing = entries[entry.destinationHash] {
-            // Only replace if new entry has strictly fewer hops
-            guard entry.hops < existing.hops else { return }
+            guard shouldReplace(existing: existing, with: entry) else { return false }
+            entries[entry.destinationHash] = merged(existing: existing, incoming: entry)
+        } else {
+            entries[entry.destinationHash] = entry
         }
-        entries[entry.destinationHash] = entry
+        return true
     }
 
     /// Look up a route entry by destination hash.
-    ///
-    /// - Parameter destinationHash: The destination hash to look up.
-    /// - Returns: The route entry if found, nil otherwise.
     public func lookup(_ destinationHash: TruncatedHash) -> RouteEntry? {
         entries[destinationHash]
     }
 
+    /// Interface that last delivered a usable announce for this destination.
+    public func interfaceId(for destinationHash: TruncatedHash) -> String? {
+        entries[destinationHash]?.interfaceId
+    }
+
     /// Check if a path exists for the given destination hash.
-    ///
-    /// - Parameter destinationHash: The destination hash to check.
-    /// - Returns: `true` if a route entry exists for this destination.
     public func hasPath(for destinationHash: TruncatedHash) -> Bool {
         entries[destinationHash] != nil
     }
 
     /// Remove a route entry by destination hash.
-    ///
-    /// - Parameter destinationHash: The destination hash to remove.
     public func removeEntry(_ destinationHash: TruncatedHash) {
         entries.removeValue(forKey: destinationHash)
     }
@@ -77,18 +109,70 @@ public actor RoutingTable {
         Array(entries.values)
     }
 
-    /// Remove entries older than the specified time interval.
-    ///
-    /// - Parameter olderThan: Maximum age in seconds. Defaults to 1 week.
+    /// Remove entries whose `expires` timestamp is in the past.
     public func removeExpired(olderThan: TimeInterval = defaultExpiry) {
         let now = Date()
         entries = entries.filter { _, entry in
-            now.timeIntervalSince(entry.timestamp) <= olderThan
+            entry.expires > now && now.timeIntervalSince(entry.timestamp) <= olderThan
         }
     }
 
     /// Number of entries in the routing table.
     public var count: Int {
         entries.count
+    }
+
+    // MARK: - Python path selection
+
+    /// Mirrors `should_add` in Python `Transport.inbound` for announces.
+    private func shouldReplace(existing: RouteEntry, with incoming: RouteEntry) -> Bool {
+        let blob = incoming.randomBlobs.last ?? Data()
+        let alreadyHeard = existing.randomBlobs.contains(blob) && !blob.isEmpty
+        let pathTimebase = existing.randomBlobs.map(Self.timebase(of:)).max() ?? existing.emittedAt
+
+        if incoming.hops <= existing.hops {
+            if !alreadyHeard && incoming.emittedAt > pathTimebase {
+                return true
+            }
+            if incoming.hops < existing.hops && incoming.emittedAt >= pathTimebase {
+                return true
+            }
+            return false
+        }
+
+        if Date() >= existing.expires {
+            return !alreadyHeard
+        }
+        if incoming.emittedAt > (existing.randomBlobs.map(Self.timebase(of:)).max() ?? existing.emittedAt) {
+            return !alreadyHeard
+        }
+        return false
+    }
+
+    private func merged(existing: RouteEntry, incoming: RouteEntry) -> RouteEntry {
+        var blobs = existing.randomBlobs
+        for blob in incoming.randomBlobs where !blob.isEmpty && !blobs.contains(blob) {
+            blobs.append(blob)
+        }
+        if blobs.count > Self.maxRandomBlobs {
+            blobs = Array(blobs.suffix(Self.maxRandomBlobs))
+        }
+        return RouteEntry(
+            destinationHash: incoming.destinationHash,
+            publicKey: incoming.publicKey,
+            nameHash: incoming.nameHash,
+            appData: incoming.appData,
+            hops: incoming.hops,
+            timestamp: incoming.timestamp,
+            interfaceId: incoming.interfaceId,
+            emittedAt: incoming.emittedAt,
+            expires: incoming.expires,
+            randomBlobs: blobs
+        )
+    }
+
+    private static func timebase(of blob: Data) -> UInt64 {
+        guard blob.count >= 10 else { return 0 }
+        return blob.subdata(in: 5..<10).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 }

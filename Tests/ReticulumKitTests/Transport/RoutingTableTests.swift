@@ -18,17 +18,34 @@ struct RoutingTableTests {
         hashByte: UInt8,
         hops: UInt8 = 1,
         timestamp: Date = Date(),
-        interfaceId: String = "test-iface"
+        interfaceId: String = "test-iface",
+        emittedAt: UInt64 = 1_700_000_000,
+        blobSeed: UInt8 = 1
     ) throws -> RouteEntry {
-        RouteEntry(
+        let blob = Self.randomBlob(emittedAt: emittedAt, seed: blobSeed)
+        return RouteEntry(
             destinationHash: try makeHash(hashByte),
             publicKey: Data(repeating: hashByte, count: 64),
             nameHash: Data(repeating: hashByte, count: 10),
             appData: nil,
             hops: hops,
             timestamp: timestamp,
-            interfaceId: interfaceId
+            interfaceId: interfaceId,
+            emittedAt: emittedAt,
+            randomBlobs: [blob]
         )
+    }
+
+    private static func randomBlob(emittedAt: UInt64, seed: UInt8) -> Data {
+        var blob = Data(repeating: seed, count: 5)
+        var value = emittedAt
+        var timeBytes = Data(count: 5)
+        for i in (0..<5).reversed() {
+            timeBytes[i] = UInt8(value & 0xff)
+            value >>= 8
+        }
+        blob.append(timeBytes)
+        return blob
     }
 
     // MARK: - Tests
@@ -55,30 +72,42 @@ struct RoutingTableTests {
     @Test("addEntry with fewer hops replaces existing entry")
     func fewerHopsReplaces() async throws {
         let table = RoutingTable()
-        let entry1 = try makeEntry(hashByte: 0x01, hops: 5)
-        let entry2 = try makeEntry(hashByte: 0x01, hops: 2)
+        let entry1 = try makeEntry(hashByte: 0x01, hops: 5, emittedAt: 100, blobSeed: 1)
+        let entry2 = try makeEntry(hashByte: 0x01, hops: 2, emittedAt: 100, blobSeed: 2)
         await table.addEntry(entry1)
         await table.addEntry(entry2)
         let result = await table.lookup(try makeHash(0x01))
         #expect(result?.hops == 2)
     }
 
-    @Test("addEntry with more hops does NOT replace existing entry")
+    @Test("addEntry with more hops does NOT replace an equally recent path")
     func moreHopsDoesNotReplace() async throws {
         let table = RoutingTable()
-        let entry1 = try makeEntry(hashByte: 0x01, hops: 2)
-        let entry2 = try makeEntry(hashByte: 0x01, hops: 5)
+        let entry1 = try makeEntry(hashByte: 0x01, hops: 2, emittedAt: 200, blobSeed: 1)
+        let entry2 = try makeEntry(hashByte: 0x01, hops: 5, emittedAt: 200, blobSeed: 2)
         await table.addEntry(entry1)
         await table.addEntry(entry2)
         let result = await table.lookup(try makeHash(0x01))
         #expect(result?.hops == 2)
+    }
+
+    @Test("addEntry with more hops DOES replace when the announce was emitted later")
+    func newerEmissionReplacesDespiteMoreHops() async throws {
+        let table = RoutingTable()
+        let entry1 = try makeEntry(hashByte: 0x01, hops: 2, interfaceId: "old", emittedAt: 100, blobSeed: 1)
+        let entry2 = try makeEntry(hashByte: 0x01, hops: 5, interfaceId: "new", emittedAt: 200, blobSeed: 2)
+        await table.addEntry(entry1)
+        await table.addEntry(entry2)
+        let result = await table.lookup(try makeHash(0x01))
+        #expect(result?.hops == 5)
+        #expect(result?.interfaceId == "new")
     }
 
     @Test("addEntry with equal hops does NOT replace (keep first)")
     func equalHopsKeepsFirst() async throws {
         let table = RoutingTable()
-        let entry1 = try makeEntry(hashByte: 0x01, hops: 3, interfaceId: "first")
-        let entry2 = try makeEntry(hashByte: 0x01, hops: 3, interfaceId: "second")
+        let entry1 = try makeEntry(hashByte: 0x01, hops: 3, interfaceId: "first", emittedAt: 100, blobSeed: 1)
+        let entry2 = try makeEntry(hashByte: 0x01, hops: 3, interfaceId: "second", emittedAt: 100, blobSeed: 2)
         await table.addEntry(entry1)
         await table.addEntry(entry2)
         let result = await table.lookup(try makeHash(0x01))

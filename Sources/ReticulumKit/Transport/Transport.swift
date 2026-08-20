@@ -362,6 +362,7 @@ public actor Transport {
             }
         }
 
+        let emittedAt = Self.announceEmitted(at: result.randomHash)
         let entry = RouteEntry(
             destinationHash: result.destinationHash,
             publicKey: result.publicKey,
@@ -369,7 +370,10 @@ public actor Transport {
             appData: result.appData,
             hops: packet.header.hops,
             timestamp: Date(),
-            interfaceId: interface.interfaceId
+            interfaceId: interface.interfaceId,
+            emittedAt: emittedAt,
+            expires: Date().addingTimeInterval(RoutingTable.defaultExpiry),
+            randomBlobs: [result.randomHash]
         )
 
         await routingTable.addEntry(entry)
@@ -381,6 +385,12 @@ public actor Transport {
 
         // T-02-12: Log only first 4 bytes of destination hash
         logger.info("Announce accepted: \(result.destinationHash.data.prefix(4).hexEncodedString)")
+    }
+
+    /// Unix seconds encoded in announce `random_hash[5..<10]` (Python path timebase).
+    private static func announceEmitted(at randomHash: Data) -> UInt64 {
+        guard randomHash.count >= 10 else { return 0 }
+        return randomHash.subdata(in: 5..<10).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
     }
 
     // MARK: - Link Management
