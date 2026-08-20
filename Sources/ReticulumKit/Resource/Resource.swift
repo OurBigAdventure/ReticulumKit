@@ -7,8 +7,7 @@
 // assembled stream, strips the random prefix, and proves with
 // SHA-256(plaintext + resource_hash).
 //
-// Deferred follow-ups: bz2 auto-compress (RK-12), dedicated HMU coverage (RK-13),
-// multi-segment size splits (RK-14), response Resources (RK-16).
+// Deferred follow-ups: bz2 auto-compress (RK-12), response Resources (RK-16).
 
 import Foundation
 import CryptoKit
@@ -51,8 +50,11 @@ public actor Resource {
     private var outstandingParts: Int
     private var sentPartCount: Int
     private var waitingForHMU: Bool
+    /// Uncompressed bytes remaining after this size-split segment (Python `Resource.split`).
+    private var followOnPlaintext: Data?
     private var segmentIndex: Int
     private var totalSegments: Int
+    private var autoCompressOption: Bool
     private let logger = Logger(label: "reticulumkit.resource")
 
     /// Number of hashmap slices required for `mapHashes` (Python HMU segments).
@@ -69,21 +71,34 @@ public actor Resource {
 
     /// Prepare an outgoing resource. Does not advertise until `advertise()`.
     ///
-    /// Compression (`autoCompress`) is reserved for a follow-up; this core path
-    /// always sends uncompressed plaintext. The resource hash is over plaintext.
+    /// Size-split multi-segment transfers set `totalSegments`/`segmentIndex` when the
+    /// payload exceeds `MAX_EFFICIENT_SIZE`. Compression (`autoCompress`) is reserved
+    /// for RK-12; this path always sends uncompressed plaintext. Hash is over plaintext.
     public static func outgoing(
         plaintext: Data,
         link: Link,
         sendPacket: @escaping @Sendable (Packet) async throws -> Void,
-        autoCompress: Bool = false
+        autoCompress: Bool = false,
+        segmentIndex: Int = 1,
+        originalHash: Data? = nil,
+        totalSegments: Int? = nil
     ) async throws -> Resource {
         let linkId = await link.linkId
         guard await link.status == .active else {
             throw ReticulumError.linkInvalidState("resource requires an active link")
         }
-        // Single-segment only; size-split multi-segment is a follow-up.
+        let sizeSegments = max(1, (plaintext.count + ResourceConstants.maxEfficientSize - 1) / ResourceConstants.maxEfficientSize)
+        let resolvedTotalSegments = totalSegments ?? sizeSegments
+        let start = (segmentIndex - 1) * ResourceConstants.maxEfficientSize
+        guard start < plaintext.count else {
+            throw ReticulumError.resourceFailed("invalid resource segment index")
+        }
+        let end = min(start + ResourceConstants.maxEfficientSize, plaintext.count)
+        let segmentPlaintext = Data(plaintext[start..<end])
+        let followOn = segmentIndex < resolvedTotalSegments ? Data(plaintext[end...]) : nil
+
+        // Compression reserved for RK-12; keep parameter for API compatibility.
         _ = autoCompress
-        let segmentPlaintext = plaintext
         let compressed = false
         let streamBody = segmentPlaintext
         let prefix = try CryptoEngine.randomBytes(count: ResourceConstants.randomHashSize)
@@ -124,9 +139,10 @@ public actor Resource {
         }
         let hash = CryptoEngine.sha256(segmentPlaintext + randomHash)
         let expectedProof = CryptoEngine.sha256(segmentPlaintext + hash)
+        let resolvedOriginalHash = originalHash ?? hash
         return Resource(
             hash: hash,
-            originalHash: hash,
+            originalHash: resolvedOriginalHash,
             initiator: true,
             status: .queued,
             link: link,
@@ -144,8 +160,10 @@ public actor Resource {
             outstandingParts: 0,
             sentPartCount: 0,
             waitingForHMU: false,
-            segmentIndex: 1,
-            totalSegments: 1,
+            followOnPlaintext: followOn,
+            segmentIndex: segmentIndex,
+            totalSegments: resolvedTotalSegments,
+            autoCompressOption: autoCompress,
             assembledData: nil,
             linkId: linkId
         )
@@ -192,8 +210,10 @@ public actor Resource {
             outstandingParts: 0,
             sentPartCount: 0,
             waitingForHMU: false,
+            followOnPlaintext: nil,
             segmentIndex: advertisement.segmentIndex,
             totalSegments: advertisement.totalSegments,
+            autoCompressOption: false,
             assembledData: nil,
             linkId: await link.linkId
         )
@@ -221,8 +241,10 @@ public actor Resource {
         outstandingParts: Int,
         sentPartCount: Int,
         waitingForHMU: Bool,
+        followOnPlaintext: Data?,
         segmentIndex: Int,
         totalSegments: Int,
+        autoCompressOption: Bool,
         assembledData: Data?,
         linkId: TruncatedHash
     ) {
@@ -245,16 +267,18 @@ public actor Resource {
         self.outstandingParts = outstandingParts
         self.sentPartCount = sentPartCount
         self.waitingForHMU = waitingForHMU
+        self.followOnPlaintext = followOnPlaintext
         self.segmentIndex = segmentIndex
         self.totalSegments = totalSegments
+        self.autoCompressOption = autoCompressOption
         self.assembledData = assembledData
         self.linkId = linkId
     }
 
     /// Advertise this outgoing resource (Python `Resource.advertise`).
     ///
-    /// The first ADV carries the first hashmap slice; further slices use RESOURCE_HMU
-    /// when the peer signals hashmap exhausted.
+    /// The first ADV carries the first hashmap slice; further slices use RESOURCE_HMU.
+    /// Size splits set `totalSegments`/`segmentIndex` and the split flag (bit 2).
     public func advertise() async throws {
         guard initiator else { return }
         var flags: UInt8 = 0x01 // encrypted
@@ -439,10 +463,85 @@ public actor Resource {
         let proofHash = proofData.prefix(half)
         let proof = proofData.suffix(half)
         if proofHash == hash && proof == expectedProof {
-            status = .complete
-            assembledData = plaintext
-            logger.info("resource complete hash=\(hash.prefix(4).hexEncodedString)")
+            if let followOnPlaintext, segmentIndex < totalSegments {
+                logger.info("resource segment \(segmentIndex)/\(totalSegments) complete, advertising next")
+                do {
+                    try await advanceToNextSizeSegment(from: followOnPlaintext)
+                } catch {
+                    logger.warning("resource next segment failed: \(error)")
+                    await fail()
+                }
+            } else {
+                status = .complete
+                assembledData = plaintext
+                logger.info("resource complete hash=\(hash.prefix(4).hexEncodedString)")
+            }
         }
+    }
+
+    /// Rebuild transfer state for the next size-split segment on this actor.
+    private func advanceToNextSizeSegment(from remaining: Data) async throws {
+        segmentIndex += 1
+        let segmentPlaintext = Data(remaining.prefix(ResourceConstants.maxEfficientSize))
+        followOnPlaintext = remaining.count > ResourceConstants.maxEfficientSize
+            ? Data(remaining.dropFirst(ResourceConstants.maxEfficientSize))
+            : nil
+
+        // Compression reserved for RK-12.
+        _ = autoCompressOption
+        let compressed = false
+        let streamBody = segmentPlaintext
+        let prefix = try CryptoEngine.randomBytes(count: ResourceConstants.randomHashSize)
+        let encrypted = try await link.encrypt(prefix + streamBody)
+        let sdu = ResourceConstants.sdu
+        let partCount = max(1, (encrypted.count + sdu - 1) / sdu)
+        var newRandomHash = try CryptoEngine.randomBytes(count: ResourceConstants.randomHashSize)
+        var newHashmap: [Data] = []
+        var chunks: [Data] = []
+        var attempts = 0
+        while true {
+            attempts += 1
+            newHashmap = []
+            chunks = []
+            var guardList: [Data] = []
+            var collided = false
+            for i in 0..<partCount {
+                let start = i * sdu
+                let end = min(start + sdu, encrypted.count)
+                let chunk = encrypted[start..<end]
+                let mapHash = Data(CryptoEngine.sha256(chunk + newRandomHash).prefix(ResourceConstants.mapHashLength))
+                if guardList.contains(mapHash) {
+                    collided = true
+                    break
+                }
+                guardList.append(mapHash)
+                newHashmap.append(mapHash)
+                chunks.append(Data(chunk))
+            }
+            if !collided { break }
+            newRandomHash = try CryptoEngine.randomBytes(count: ResourceConstants.randomHashSize)
+            guard attempts < 8 else {
+                throw ReticulumError.resourceFailed("hashmap collision")
+            }
+        }
+        let newHash = CryptoEngine.sha256(segmentPlaintext + newRandomHash)
+        let newProof = CryptoEngine.sha256(segmentPlaintext + newHash)
+
+        let priorHash = hash
+        await link.removeResource(hash: priorHash, outgoing: true)
+        hash = newHash
+        randomHash = newRandomHash
+        expectedProof = newProof
+        plaintext = segmentPlaintext
+        self.compressed = compressed
+        parts = chunks.map { Optional($0) }
+        hashmap = newHashmap
+        mapHashes = newHashmap
+        sentPartCount = 0
+        waitingForHMU = false
+        status = .queued
+        await link.registerOutgoingResource(self)
+        try await advertise()
     }
 
     /// Cancel this transfer.
@@ -463,7 +562,7 @@ public actor Resource {
                 throw ReticulumError.resourceFailed("short resource")
             }
             decrypted = Data(decrypted.dropFirst(ResourceConstants.randomHashSize))
-            // bz2 inflate is a follow-up; compressed ADV is treated as corrupt here.
+            // bz2 inflate is RK-12; compressed ADV is treated as corrupt here.
             if compressed {
                 status = .corrupt
                 return
@@ -476,9 +575,39 @@ public actor Resource {
             }
             let proof = CryptoEngine.sha256(uncompressed + hash)
             try await sendPacket(linkPacket(context: .resourcePRF, data: hash + proof, packetType: .proof))
-            assembledData = uncompressed
+
+            if !initiator, totalSegments > 1 {
+                if segmentIndex < totalSegments {
+                    await link.storeSplitSegment(
+                        originalHash: originalHash,
+                        segmentIndex: segmentIndex,
+                        data: uncompressed,
+                        totalSegments: totalSegments
+                    )
+                    status = .complete
+                    assembledData = nil
+                    await link.removeResource(hash: hash, outgoing: false)
+                    logger.info(
+                        "resource segment \(segmentIndex)/\(totalSegments) assembled hash=\(hash.prefix(4).hexEncodedString), awaiting next ADV"
+                    )
+                    return
+                }
+                if let full = await link.completeSplitAssembly(
+                    originalHash: originalHash,
+                    segmentIndex: segmentIndex,
+                    finalSegment: uncompressed,
+                    totalSegments: totalSegments
+                ) {
+                    assembledData = full
+                } else {
+                    status = .corrupt
+                    return
+                }
+            } else {
+                assembledData = uncompressed
+            }
             status = .complete
-            logger.info("resource assembled hash=\(hash.prefix(4).hexEncodedString) bytes=\(uncompressed.count)")
+            logger.info("resource assembled hash=\(hash.prefix(4).hexEncodedString) bytes=\(assembledData?.count ?? uncompressed.count) compressed=\(compressed)")
         } catch {
             status = .corrupt
         }

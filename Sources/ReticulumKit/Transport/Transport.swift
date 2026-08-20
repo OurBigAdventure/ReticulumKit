@@ -687,6 +687,18 @@ public actor Transport {
             logger.warning("Invalid resource advertisement")
             return
         }
+        if advertisement.totalSegments > 1, advertisement.segmentIndex > 1 {
+            let expecting = await link.isExpectingSplitSegment(
+                originalHash: advertisement.originalHash,
+                segmentIndex: advertisement.segmentIndex
+            )
+            guard expecting else {
+                logger.debug(
+                    "Ignoring split resource ADV segment \(advertisement.segmentIndex)/\(advertisement.totalSegments) - not expected"
+                )
+                return
+            }
+        }
         let resource = await Resource.incoming(advertisement: advertisement, link: link) { [weak self] packet in
             guard let self else { return }
             try await self.sendPacket(packet)

@@ -58,6 +58,15 @@ public actor Link {
     /// Incoming resources keyed by 32-byte resource hash.
     private var incomingResources: [Data: Resource] = [:]
 
+    /// In-progress multi-segment resource receive (Python split Resource), keyed by original hash.
+    private struct SplitResourceAssembly {
+        var accumulated: Data
+        var totalSegments: Int
+        var nextExpectedSegment: Int
+    }
+
+    private var splitResourceAssemblies: [Data: SplitResourceAssembly] = [:]
+
     /// Test-accessible property: true if ephemeral private key is still held.
     public var hasEphemeralKey: Bool {
         ephemeralPrivateKey != nil
@@ -736,6 +745,47 @@ public actor Link {
         } else {
             incomingResources.removeValue(forKey: hash)
         }
+    }
+
+    /// True when a size-split resource ADV is the next expected segment.
+    func isExpectingSplitSegment(originalHash: Data, segmentIndex: Int) -> Bool {
+        guard segmentIndex > 1, let state = splitResourceAssemblies[originalHash] else { return false }
+        return state.nextExpectedSegment == segmentIndex
+    }
+
+    /// Store a completed split segment and advance the expected segment index.
+    func storeSplitSegment(originalHash: Data, segmentIndex: Int, data: Data, totalSegments: Int) {
+        if segmentIndex == 1 {
+            splitResourceAssemblies[originalHash] = SplitResourceAssembly(
+                accumulated: data,
+                totalSegments: totalSegments,
+                nextExpectedSegment: 2
+            )
+            return
+        }
+        guard let state = splitResourceAssemblies[originalHash],
+              state.nextExpectedSegment == segmentIndex,
+              segmentIndex < totalSegments else { return }
+        state.accumulated.append(data)
+        state.nextExpectedSegment = segmentIndex + 1
+        splitResourceAssemblies[originalHash] = state
+    }
+
+    /// Append the final split segment and return the full assembled plaintext.
+    func completeSplitAssembly(
+        originalHash: Data,
+        segmentIndex: Int,
+        finalSegment: Data,
+        totalSegments: Int
+    ) -> Data? {
+        guard segmentIndex == totalSegments else { return nil }
+        if totalSegments == 1 { return finalSegment }
+        guard let state = splitResourceAssemblies[originalHash],
+              state.nextExpectedSegment == segmentIndex else { return nil }
+        var full = state.accumulated
+        full.append(finalSegment)
+        splitResourceAssemblies.removeValue(forKey: originalHash)
+        return full
     }
 
     // MARK: - Activity Tracking
