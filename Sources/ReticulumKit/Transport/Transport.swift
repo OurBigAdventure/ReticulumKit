@@ -180,10 +180,33 @@ public actor Transport {
 
     /// Send a packet through all online interfaces.
     ///
+    /// When hops > 1 and `nextHop` is a real transport id (not the dest itself),
+    /// the wire form is rebuilt as HEADER_2 TRANSPORT so a hub can reverse-route
+    /// proofs. Last-hop HEADER_1 announces store nextHop == dest; wrapping those
+    /// as HEADER_2 addressed to the peer is dropped by public TCP hubs — send
+    /// HEADER_1 and let the hub insert into transport. Hops == 1 stays HEADER_1.
+    ///
     /// - Parameter packet: The packet to send.
     /// - Throws: If packing fails.
     public func sendPacket(_ packet: Packet) async throws {
-        let packedData = try packet.pack()
+        let packedData: Data
+        if packet.header.packetType == .announce
+            || packet.header.destinationType == .plain
+            || packet.header.destinationType == .group {
+            packedData = try packet.pack()
+        } else if let route = await routingTable.lookup(packet.destinationHash) {
+            let type1 = try packet.pack()
+            let canWrap = packet.header.headerType == .type1
+                && route.hops > 1
+                && route.nextHop != route.destinationHash
+            if canWrap {
+                packedData = try Packet.insertIntoTransport(type1Raw: type1, nextHop: route.nextHop)
+            } else {
+                packedData = type1
+            }
+        } else {
+            packedData = try packet.pack()
+        }
         for interface in interfaces {
             let isOnline = await interface.isOnline
             guard isOnline else { continue }
@@ -362,6 +385,8 @@ public actor Transport {
             }
         }
 
+        // Python `received_from`: HEADER_2 transport_id, else dest hash.
+        let nextHop = packet.transportId ?? result.destinationHash
         let entry = RouteEntry(
             destinationHash: result.destinationHash,
             publicKey: result.publicKey,
@@ -369,7 +394,8 @@ public actor Transport {
             appData: result.appData,
             hops: packet.header.hops,
             timestamp: Date(),
-            interfaceId: interface.interfaceId
+            interfaceId: interface.interfaceId,
+            nextHop: nextHop
         )
 
         await routingTable.addEntry(entry)
@@ -387,8 +413,9 @@ public actor Transport {
 
     /// Establish a link to a remote destination.
     ///
-    /// Creates an initiator Link, sends the link request through all online interfaces,
-    /// and stores the link in pendingLinks keyed by the target destination hash.
+    /// Creates an initiator Link, sends the link request via `sendPacket` (so
+    /// multi-hop HEADER_2 wrap applies), and stores the link in pendingLinks
+    /// keyed by the target destination hash.
     ///
     /// - Parameters:
     ///   - destinationHash: The destination hash to link to.
@@ -397,7 +424,6 @@ public actor Transport {
     public func establishLink(to destinationHash: TruncatedHash, identity: Identity) async throws -> Link {
         let link = Link.initiator(to: destinationHash, identity: identity)
         let (packet, _) = try await link.createRequest()
-        let packedData = try packet.pack()
         let linkId = await link.linkId
         let destHex = destinationHash.data.prefix(4).hexEncodedString
         let linkHex = linkId.data.prefix(4).hexEncodedString
@@ -411,23 +437,11 @@ public actor Transport {
 
         pendingLinks[destinationHash] = link
 
-        var sentOn = 0
-        for interface in interfaces {
-            let isOnline = await interface.isOnline
-            guard isOnline else {
-                logger.debug("establishLink: skipping offline interface \(interface.interfaceId)")
-                continue
-            }
-            do {
-                try await interface.send(packedData)
-                sentOn += 1
-                logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent on \(interface.interfaceId) (\(packedData.count) bytes)")
-            } catch {
-                logger.warning("establishLink: failed to send link request on \(interface.interfaceId): \(error)")
-            }
-        }
-        if sentOn == 0 {
-            logger.warning("establishLink: link=\(linkHex) -> \(destHex) NO online interface; request not transmitted")
+        try await sendPacket(packet)
+        if routeEntry == nil {
+            logger.info("establishLink: link=\(linkHex) -> \(destHex) request broadcast on online interfaces")
+        } else {
+            logger.info("establishLink: link=\(linkHex) -> \(destHex) request sent via sendPacket on \(routeEntry!.interfaceId)")
         }
 
         return link

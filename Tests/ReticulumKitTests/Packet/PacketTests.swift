@@ -344,3 +344,62 @@ struct PacketValidationTests {
         }
     }
 }
+
+@Suite("Packet transport insert")
+struct PacketTransportInsertTests {
+
+    @Test("HEADER_1 SINGLE becomes HEADER_2 TRANSPORT with next hop inserted")
+    func wrapMatchesPythonOutbound() throws {
+        let dest = makeHash(0xAA)
+        let nextHop = makeHash(0xBB)
+        let header = PacketHeader(
+            headerType: .type1,
+            propagationType: .broadcast,
+            destinationType: .single,
+            packetType: .data,
+            hops: 0
+        )
+        let packet = Packet(
+            header: header,
+            destinationHash: dest,
+            context: .none,
+            data: Data([0x01, 0x02, 0x03])
+        )
+        let type1 = try packet.pack()
+        let wrapped = try Packet.insertIntoTransport(type1Raw: type1, nextHop: nextHop)
+        let unpacked = try Packet.unpack(wrapped)
+
+        #expect(unpacked.header.headerType == .type2)
+        #expect(unpacked.header.propagationType == .transport)
+        #expect(unpacked.header.destinationType == .single)
+        #expect(unpacked.header.packetType == .data)
+        #expect(unpacked.header.hops == 0)
+        #expect(unpacked.transportId == nextHop)
+        #expect(unpacked.destinationHash == dest)
+        #expect(unpacked.data == Data([0x01, 0x02, 0x03]))
+        #expect(
+            Packet.hashablePart(raw: type1, headerType: .type1)
+                == Packet.hashablePart(raw: wrapped, headerType: .type2)
+        )
+    }
+
+    @Test("Already HEADER_2 raw is left unchanged")
+    func type2Passthrough() throws {
+        let dest = makeHash(0xCC)
+        let tid = makeHash(0xDD)
+        let packet = Packet(
+            header: PacketHeader(
+                headerType: .type2,
+                propagationType: .transport,
+                destinationType: .single,
+                packetType: .data
+            ),
+            destinationHash: dest,
+            transportId: tid,
+            data: Data([0x09])
+        )
+        let type2 = try packet.pack()
+        let again = try Packet.insertIntoTransport(type1Raw: type2, nextHop: makeHash(0xEE))
+        #expect(again == type2)
+    }
+}

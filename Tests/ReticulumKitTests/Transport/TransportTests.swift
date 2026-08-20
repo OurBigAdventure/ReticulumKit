@@ -183,5 +183,165 @@ struct TransportTests {
         #expect(entry != nil)
         #expect(entry?.publicKey == identity.publicKeyBytes)
         #expect(entry?.destinationHash == destination.hash)
+        #expect(entry?.nextHop == destination.hash)
+    }
+
+    @Test("HEADER_2 announce stores transport_id as nextHop")
+    func announceType2StoresNextHop() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "iface-hub")
+        await transport.addInterface(mock)
+
+        let identity = Identity()
+        let destination = Destination(identity: identity, direction: .out, appName: "test.app", aspects: ["messaging"])
+        let announcePacket = try Announce.create(destination: destination)
+        let type1 = try announcePacket.pack()
+        let hubId = try TruncatedHash(Data(repeating: 0x42, count: 16))
+        let wrapped = try Packet.insertIntoTransport(type1Raw: type1, nextHop: hubId)
+
+        await mock.feedPacket(wrapped)
+        try await Task.sleep(for: .milliseconds(200))
+
+        let entry = await transport.routingTable.lookup(destination.hash)
+        #expect(entry?.nextHop == hubId)
+        #expect(entry?.interfaceId == "iface-hub")
+    }
+
+    @Test("sendPacket wraps HEADER_2 when path hops > 1")
+    func sendPacketWrapsWhenHopsGreaterThanOne() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "tcp-hub")
+        await transport.addInterface(mock)
+
+        let peer = try TruncatedHash(Data(repeating: 0xAA, count: 16))
+        let hub = try TruncatedHash(Data(repeating: 0xBB, count: 16))
+        await transport.routingTable.addEntry(RouteEntry(
+            destinationHash: peer,
+            publicKey: Data(repeating: 0xAA, count: 64),
+            nameHash: Data(repeating: 0xAA, count: 10),
+            appData: nil,
+            hops: 3,
+            timestamp: Date(),
+            interfaceId: mock.interfaceId,
+            nextHop: hub
+        ))
+
+        let packet = Packet(
+            header: PacketHeader(
+                headerType: .type1,
+                propagationType: .broadcast,
+                destinationType: .single,
+                packetType: .data
+            ),
+            destinationHash: peer,
+            data: Data([0x01, 0x02])
+        )
+        try await transport.sendPacket(packet)
+
+        let sent = await mock.sentPackets[0]
+        let unpacked = try Packet.unpack(sent)
+        #expect(unpacked.header.headerType == .type2)
+        #expect(unpacked.header.propagationType == .transport)
+        #expect(unpacked.transportId == hub)
+        #expect(unpacked.destinationHash == peer)
+        #expect(unpacked.data == Data([0x01, 0x02]))
+    }
+
+    @Test("sendPacket stays HEADER_1 when hops > 1 but nextHop is the dest")
+    func sendPacketNoWrapWhenNextHopIsDestination() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "tcp-hub")
+        await transport.addInterface(mock)
+
+        let peer = try TruncatedHash(Data(repeating: 0xAA, count: 16))
+        await transport.routingTable.addEntry(RouteEntry(
+            destinationHash: peer,
+            publicKey: Data(repeating: 0xAA, count: 64),
+            nameHash: Data(repeating: 0xAA, count: 10),
+            appData: nil,
+            hops: 3,
+            timestamp: Date(),
+            interfaceId: mock.interfaceId,
+            nextHop: peer
+        ))
+
+        let packet = Packet(
+            header: PacketHeader(
+                headerType: .type1,
+                propagationType: .broadcast,
+                destinationType: .single,
+                packetType: .data
+            ),
+            destinationHash: peer,
+            data: Data([0x01, 0x02])
+        )
+        try await transport.sendPacket(packet)
+
+        let unpacked = try Packet.unpack(await mock.sentPackets[0])
+        #expect(unpacked.header.headerType == .type1)
+        #expect(unpacked.transportId == nil)
+        #expect(unpacked.destinationHash == peer)
+    }
+
+    @Test("sendPacket stays HEADER_1 when path hops is 1")
+    func sendPacketNoWrapWhenAdjacent() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "tcp-hub")
+        await transport.addInterface(mock)
+
+        let peer = try TruncatedHash(Data(repeating: 0xCC, count: 16))
+        await transport.routingTable.addEntry(RouteEntry(
+            destinationHash: peer,
+            publicKey: Data(repeating: 0xCC, count: 64),
+            nameHash: Data(repeating: 0xCC, count: 10),
+            appData: nil,
+            hops: 1,
+            timestamp: Date(),
+            interfaceId: mock.interfaceId
+        ))
+
+        let packet = Packet(
+            header: PacketHeader(
+                headerType: .type1,
+                propagationType: .broadcast,
+                destinationType: .single,
+                packetType: .data
+            ),
+            destinationHash: peer,
+            data: Data([0x09])
+        )
+        try await transport.sendPacket(packet)
+
+        let unpacked = try Packet.unpack(await mock.sentPackets[0])
+        #expect(unpacked.header.headerType == .type1)
+        #expect(unpacked.transportId == nil)
+        #expect(unpacked.destinationHash == peer)
+    }
+
+    @Test("establishLink uses sendPacket wrap when nextHop is a transport id")
+    func establishLinkWrapsWhenNextHopIsHub() async throws {
+        let transport = Transport()
+        let mock = MockTransportInterface(id: "tcp-hub")
+        await transport.addInterface(mock)
+
+        let peer = try TruncatedHash(Data(repeating: 0xAA, count: 16))
+        let hub = try TruncatedHash(Data(repeating: 0xBB, count: 16))
+        await transport.routingTable.addEntry(RouteEntry(
+            destinationHash: peer,
+            publicKey: Data(repeating: 0xAA, count: 64),
+            nameHash: Data(repeating: 0xAA, count: 10),
+            appData: nil,
+            hops: 3,
+            timestamp: Date(),
+            interfaceId: mock.interfaceId,
+            nextHop: hub
+        ))
+
+        _ = try await transport.establishLink(to: peer, identity: Identity())
+        let unpacked = try Packet.unpack(await mock.sentPackets[0])
+        #expect(unpacked.header.packetType == .linkRequest)
+        #expect(unpacked.header.headerType == .type2)
+        #expect(unpacked.transportId == hub)
+        #expect(unpacked.destinationHash == peer)
     }
 }

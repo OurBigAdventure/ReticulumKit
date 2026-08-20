@@ -76,6 +76,33 @@ public struct Packet: Sendable, Equatable {
         return raw
     }
 
+    /// Rebuild HEADER_1 wire bytes as HEADER_2 TRANSPORT with `nextHop` inserted.
+    ///
+    /// Matches Python `Transport.outbound`:
+    /// `new_flags = (HEADER_2 << 6) | (TRANSPORT << 4) | (flags & 0x0F)`,
+    /// then hops, next-hop hash, then `raw[2:]` (dest hash + context + data).
+    /// Packet hashable parts stay the same so delivery proofs still match.
+    /// Already-HEADER_2 input is returned unchanged.
+    public static func insertIntoTransport(type1Raw: Data, nextHop: TruncatedHash) throws -> Data {
+        guard type1Raw.count >= ReticulumConstants.headerMinSize else {
+            throw ReticulumError.packetTooShort
+        }
+        let header = try PacketHeader.decode(type1Raw)
+        guard header.headerType == .type1 else {
+            return type1Raw
+        }
+        let flags = (type1Raw[type1Raw.startIndex] & 0x0F)
+            | (HeaderType.type2.rawValue << 6)
+            | (PropagationType.transport.rawValue << 4)
+        var raw = Data([flags, type1Raw[type1Raw.startIndex + 1]])
+        raw.append(nextHop.data)
+        raw.append(type1Raw.suffix(from: type1Raw.startIndex + 2))
+        guard raw.count <= ReticulumConstants.MTU else {
+            throw ReticulumError.packetTooLong(raw.count)
+        }
+        return raw
+    }
+
     /// Unpack from wire format bytes.
     ///
     /// - Parameter raw: Raw wire-format bytes (at least `ReticulumConstants.headerMinSize` bytes).

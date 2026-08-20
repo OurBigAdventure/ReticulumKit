@@ -23,6 +23,32 @@ public struct RouteEntry: Sendable {
     public let timestamp: Date
     /// Identifier of the interface this announce arrived on
     public let interfaceId: String
+    /// Next hop on this path (Python `IDX_PT_NEXT_HOP` / `received_from`).
+    ///
+    /// HEADER_2 announces store `packet.transport_id` (usually the hub).
+    /// HEADER_1 announces store the destination hash (peer is on this interface).
+    /// Defaults to `destinationHash` when omitted.
+    public let nextHop: TruncatedHash
+
+    public init(
+        destinationHash: TruncatedHash,
+        publicKey: Data,
+        nameHash: Data,
+        appData: Data?,
+        hops: UInt8,
+        timestamp: Date,
+        interfaceId: String,
+        nextHop: TruncatedHash? = nil
+    ) {
+        self.destinationHash = destinationHash
+        self.publicKey = publicKey
+        self.nameHash = nameHash
+        self.appData = appData
+        self.hops = hops
+        self.timestamp = timestamp
+        self.interfaceId = interfaceId
+        self.nextHop = nextHop ?? destinationHash
+    }
 }
 
 /// Actor-isolated routing table for thread-safe access from multiple interfaces.

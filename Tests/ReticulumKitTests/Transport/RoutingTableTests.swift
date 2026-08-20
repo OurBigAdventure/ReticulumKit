@@ -42,6 +42,34 @@ struct RoutingTableTests {
         #expect(result != nil)
         #expect(result?.destinationHash == entry.destinationHash)
         #expect(result?.hops == 1)
+        #expect(result?.nextHop == entry.destinationHash)
+    }
+
+    @Test("RouteEntry nextHop defaults to destinationHash")
+    func nextHopDefaultsToDestination() async throws {
+        let table = RoutingTable()
+        let entry = try makeEntry(hashByte: 0xAB)
+        await table.addEntry(entry)
+        let result = await table.lookup(try makeHash(0xAB))
+        #expect(result?.nextHop == entry.destinationHash)
+    }
+
+    @Test("RouteEntry stores explicit nextHop")
+    func nextHopExplicit() async throws {
+        let table = RoutingTable()
+        let nextHop = try makeHash(0x11)
+        let entry = RouteEntry(
+            destinationHash: try makeHash(0xAB),
+            publicKey: Data(repeating: 0xAB, count: 64),
+            nameHash: Data(repeating: 0xAB, count: 10),
+            appData: nil,
+            hops: 2,
+            timestamp: Date(),
+            interfaceId: "hub",
+            nextHop: nextHop
+        )
+        await table.addEntry(entry)
+        #expect(await table.lookup(try makeHash(0xAB))?.nextHop == nextHop)
     }
 
     @Test("lookup returns nil for unknown hash")
