@@ -67,7 +67,14 @@ public actor AutoInterface: NetworkInterface {
     private var discoveryGroup: NWConnectionGroup?
     private var dataGroup: NWConnectionGroup?
     private var pruneTask: Task<Void, Never>?
+    /// Link-local address used for discovery token emission (Python sender address).
+    private var localDiscoveryAddress: String?
     private let logger = Logger(label: "ReticulumKit.AutoInterface")
+
+    /// Resolve the primary link-local IPv6 address for discovery token computation.
+    public static func resolveLinkLocalAddress() -> String? {
+        LinkLocalAddress.primary()
+    }
 
     // MARK: - Init
 
@@ -275,7 +282,11 @@ public actor AutoInterface: NetworkInterface {
         switch state {
         case .ready:
             _isOnline = true
+            if localDiscoveryAddress == nil {
+                localDiscoveryAddress = Self.resolveLinkLocalAddress()
+            }
             logger.info("AutoInterface ready")
+            Task { await self.sendDiscoveryAnnouncement() }
         case .failed(let error):
             _isOnline = false
             logger.warning("AutoInterface failed: \(error.localizedDescription)")
@@ -326,19 +337,17 @@ public actor AutoInterface: NetworkInterface {
 
     /// Send our discovery token to the multicast group.
     private func sendDiscoveryAnnouncement() async {
-        // We need our own link-local address to compute the token.
-        // For now, send a general announcement; peers will validate on their side.
         guard let discoveryGroup else { return }
 
-        // The discovery token is computed from our own address, which we learn
-        // from the connection group's local endpoint. In practice, the token
-        // is validated by the receiver based on the sender's observed address.
-        // We send a placeholder that will be validated against our actual source IP.
-        let token = Self.discoveryToken(groupId: groupId, address: "local")
+        guard let address = localDiscoveryAddress ?? Self.resolveLinkLocalAddress() else {
+            logger.debug("No link-local address for discovery token")
+            return
+        }
+        localDiscoveryAddress = address
+        let token = Self.discoveryToken(groupId: groupId, address: address)
 
         discoveryGroup.send(content: token) { error in
             if let error {
-                // Log but don't throw — discovery is best-effort
                 _ = error
             }
         }

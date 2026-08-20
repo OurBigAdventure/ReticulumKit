@@ -62,6 +62,30 @@ struct AutoInterfaceTests {
         #expect(t1 != t2)
     }
 
+    @Test("discoveryToken matches Python SHA256(group_id + address)[:16]")
+    func discoveryTokenPythonFixture() {
+        // Python: hashlib.sha256(b"reticulum" + b"fe80::1").digest()[:16]
+        let token = AutoInterface.discoveryToken(groupId: "reticulum", address: "fe80::1")
+        #expect(token.hexEncodedString == "97b25576749ea936b0d8a8536ffaf442")
+    }
+
+    // MARK: - Link-local address resolution
+
+    @Test("resolveLinkLocalAddress is nil or fe80 without zone suffix")
+    func resolveLinkLocalAddressFormat() {
+        if let addr = AutoInterface.resolveLinkLocalAddress() {
+            #expect(addr.lowercased().hasPrefix("fe80:"))
+            #expect(!addr.contains("%"))
+        }
+    }
+
+    @Test("resolveLinkLocalAddress is stable across calls")
+    func resolveLinkLocalAddressStable() {
+        let a = AutoInterface.resolveLinkLocalAddress()
+        let b = AutoInterface.resolveLinkLocalAddress()
+        #expect(a == b)
+    }
+
     // MARK: - Peer Tracking
 
     @Test("addPeer stores peer and increments count")
