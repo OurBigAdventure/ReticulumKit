@@ -302,4 +302,67 @@ struct TransportLinkTests {
         try await sendTask.value
         #expect(box.received == payload)
     }
+
+    @Test("Oversized resource ADV is rejected when delivery limit is set")
+    func resourceDeliveryLimitRejectsOversizedADV() async throws {
+        let (transportA, transportB, mockA, mockB, linkA) = try await setupEstablishedLink()
+        let linkId = await linkA.linkId
+        let linkB = await transportB.link(for: linkId)
+        #expect(linkB != nil)
+
+        // Cap receiver well below the payload size so ADV is refused with RESOURCE_RCL.
+        await transportB.setMaxResourceDeliveryBytes(500)
+
+        final class Box: @unchecked Sendable {
+            var received: Data?
+        }
+        let box = Box()
+        await transportB.onIncomingResource { data, _ in
+            box.received = data
+        }
+
+        let payload = Data(repeating: 0x5A, count: 2_400)
+        var lastA = await mockA.sentPackets.count
+        var lastB = await mockB.sentPackets.count
+        var spins = 0
+        final class Flag: @unchecked Sendable {
+            var done = false
+            var error: Error?
+        }
+        let flag = Flag()
+        let sendTask = Task {
+            defer { flag.done = true }
+            do {
+                try await transportA.sendResource(on: linkA, plaintext: payload, timeout: 5)
+            } catch {
+                flag.error = error
+            }
+        }
+        var sawRCL = false
+        while !flag.done && spins < 200 {
+            let sentA = await mockA.sentPackets
+            if sentA.count > lastA {
+                for packet in sentA[lastA..<sentA.count] {
+                    await mockB.feedPacket(packet)
+                }
+                lastA = sentA.count
+            }
+            let sentB = await mockB.sentPackets
+            if sentB.count > lastB {
+                for packet in sentB[lastB..<sentB.count] {
+                    if let unpacked = try? Packet.unpack(packet), unpacked.context == .resourceRCL {
+                        sawRCL = true
+                    }
+                    await mockA.feedPacket(packet)
+                }
+                lastB = sentB.count
+            }
+            try await Task.sleep(for: .milliseconds(25))
+            spins += 1
+        }
+        _ = await sendTask.result
+        #expect(sawRCL, "receiver should send RESOURCE_RCL for over-limit ADV")
+        #expect(box.received == nil, "over-limit resource must not assemble")
+        #expect(flag.error != nil, "sender should fail after RESOURCE_RCL rejection")
+    }
 }

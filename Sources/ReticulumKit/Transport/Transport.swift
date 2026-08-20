@@ -81,12 +81,30 @@ public actor Transport {
     /// Outgoing resource reached COMPLETE (initiator side).
     private var outgoingResourceCallback: (@Sendable (Resource, Link) async -> Void)?
 
+    /// Maximum assembled Resource plaintext accepted from peers (Python delivery limit).
+    ///
+    /// Defaults to `ResourceConstants.maxEfficientSize`. Callers that accept larger
+    /// LXMF / NomadNet transfers (for example ~10 MB) should raise this via
+    /// ``setMaxResourceDeliveryBytes(_:)``.
+    private var maxResourceDeliveryBytes: Int = ResourceConstants.maxEfficientSize
+
     /// Logger for transport events.
     private let logger = Logger(label: "reticulumkit.transport")
 
     // MARK: - Initialization
 
     public init() {}
+
+    /// Cap inbound assembled Resource plaintext size.
+    ///
+    /// Advertisements whose `dataSize` exceeds this limit are rejected with
+    /// `RESOURCE_RCL` and never assembled, matching Python delivery/transfer
+    /// limits used by LXMF propagation-node configuration.
+    ///
+    /// - Parameter bytes: Maximum accepted plaintext size in bytes.
+    public func setMaxResourceDeliveryBytes(_ bytes: Int) {
+        maxResourceDeliveryBytes = bytes
+    }
 
     // MARK: - Interface Management
 
@@ -685,6 +703,27 @@ public actor Transport {
         guard let plaintext = try? await link.decrypt(packet.data),
               let advertisement = try? ResourceAdvertisement.unpack(plaintext) else {
             logger.warning("Invalid resource advertisement")
+            return
+        }
+        // Reject oversized ADV before allocating an incoming Resource (Python delivery limit).
+        if advertisement.dataSize > maxResourceDeliveryBytes {
+            logger.info(
+                "Rejecting resource over delivery limit \(advertisement.dataSize) bytes plaintext (max \(maxResourceDeliveryBytes))"
+            )
+            if let encrypted = try? await link.encrypt(advertisement.hash) {
+                let reject = Packet(
+                    header: PacketHeader(
+                        headerType: .type1,
+                        propagationType: .broadcast,
+                        destinationType: .link,
+                        packetType: .data
+                    ),
+                    destinationHash: await link.linkId,
+                    context: .resourceRCL,
+                    data: encrypted
+                )
+                try? await sendPacket(reject)
+            }
             return
         }
         let resource = await Resource.incoming(advertisement: advertisement, link: link) { [weak self] packet in
