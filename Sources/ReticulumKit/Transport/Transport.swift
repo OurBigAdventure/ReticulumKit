@@ -610,7 +610,8 @@ public actor Transport {
                 if let unpacked = LinkRequestCodec.unpackRequest(plaintext),
                    let handler = linkRequestHandler,
                    let responsePayload = await handler(link, unpacked.pathHash, unpacked.payload) {
-                    let requestId = CryptoEngine.truncatedHash(plaintext)
+                    // Python `Link.handle_request`: request_id = packet.getTruncatedHash().
+                    let requestId = try packet.truncatedHash()
                     let response = LinkRequestCodec.packResponse(requestId: requestId, payload: responsePayload)
                     // Oversized replies (Resource is_response) are a follow-up; drop with a warning.
                     guard response.count <= LinkConstants.mdu else {
@@ -668,24 +669,26 @@ public actor Transport {
         timeout: TimeInterval = 120
     ) async throws -> Data {
         let plaintext = LinkRequestCodec.packRequest(path: path, payload: payload)
-        let requestId = CryptoEngine.truncatedHash(plaintext)
+        let encrypted = try await link.encrypt(plaintext)
+        let linkId = await link.linkId
+        let packet = Packet(
+            header: PacketHeader(
+                headerType: .type1,
+                propagationType: .broadcast,
+                destinationType: .link,
+                packetType: .data
+            ),
+            destinationHash: linkId,
+            context: .request,
+            data: encrypted
+        )
+        // Python RequestReceipt: request_id = packet_receipt.truncated_hash
+        // (`Packet.getTruncatedHash()`), not truncated_hash(plaintext).
+        let requestId = try packet.truncatedHash()
         return try await withCheckedThrowingContinuation { continuation in
             pendingLinkRequests[requestId] = continuation
             Task {
                 do {
-                    let encrypted = try await link.encrypt(plaintext)
-                    let linkId = await link.linkId
-                    let packet = Packet(
-                        header: PacketHeader(
-                            headerType: .type1,
-                            propagationType: .broadcast,
-                            destinationType: .link,
-                            packetType: .data
-                        ),
-                        destinationHash: linkId,
-                        context: .request,
-                        data: encrypted
-                    )
                     try await sendPacket(packet)
                 } catch {
                     if pendingLinkRequests.removeValue(forKey: requestId) != nil {

@@ -3,7 +3,8 @@
 //
 // Wire: msgpack `[timestamp(float64), path_hash(bin16), payload]`.
 // Path hash is SHA-256(path UTF-8) truncated to 16 bytes.
-// Packet request id is the truncated RNS packet hash; response is
+// Packet request id is Python `Packet.getTruncatedHash()` of the REQUEST
+// packet (not truncated_hash of the plaintext body). Response is
 // msgpack `[request_id(bin16), response]`.
 
 import Foundation

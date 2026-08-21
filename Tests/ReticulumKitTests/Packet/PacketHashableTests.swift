@@ -151,4 +151,28 @@ struct PacketHashableTests {
         // Transport ID is skipped
         #expect(hashable.count == 82)
     }
+
+    @Test("truncatedPacketHash uses untrimmed hashable part, not ciphertext alone")
+    func truncatedPacketHashForLinkRequest() throws {
+        let destHash = try TruncatedHash(Data(repeating: 0x11, count: 16))
+        let header = PacketHeader(
+            headerType: .type1,
+            propagationType: .broadcast,
+            destinationType: .link,
+            packetType: .data,
+            hops: 1
+        )
+        let ciphertext = Data(repeating: 0x5A, count: 200)
+        let packet = Packet(
+            header: header,
+            destinationHash: destHash,
+            context: .request,
+            data: ciphertext
+        )
+        let raw = try packet.pack()
+        let expected = CryptoEngine.truncatedHash(Packet.dataPacketHashablePart(raw: raw, headerType: .type1))
+        #expect(Packet.truncatedPacketHash(raw: raw, headerType: .type1) == expected)
+        #expect(try packet.truncatedHash() == expected)
+        #expect(expected != CryptoEngine.truncatedHash(ciphertext))
+    }
 }
