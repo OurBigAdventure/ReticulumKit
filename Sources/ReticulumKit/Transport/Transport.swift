@@ -629,7 +629,8 @@ public actor Transport {
                 if let unpacked = LinkRequestCodec.unpackRequest(plaintext),
                    let handler = linkRequestHandler,
                    let responsePayload = await handler(link, unpacked.pathHash, unpacked.payload) {
-                    let requestId = CryptoEngine.truncatedHash(plaintext)
+                    // Python `Link.handle_request`: request_id = packet.getTruncatedHash().
+                    let requestId = try packet.truncatedHash()
                     let response = LinkRequestCodec.packResponse(requestId: requestId, payload: responsePayload)
                     if response.count <= LinkConstants.mdu {
                         let encrypted = try await link.encrypt(response)
@@ -683,17 +684,21 @@ public actor Transport {
                 for resource in await link.incomingResourceList() {
                     await resource.receivePart(packet.data)
                     if await resource.status == .complete, let data = await resource.assembledData {
-                        if let requestId = await resource.responseRequestId,
-                           let cont = pendingLinkRequests.removeValue(forKey: requestId) {
-                            // Packed RESPONSE Resource: msgpack [request_id, payload].
-                            // File responses may be raw bytes; fall back to whole body.
-                            if let unpacked = LinkRequestCodec.unpackResponse(data) {
+                        let completed = completePendingLinkRequestIfNeeded(
+                            resourceData: data,
+                            responseRequestId: await resource.responseRequestId
+                        )
+                        if !completed {
+                            if let orphanId = await resource.responseRequestId {
+                                logger.warning(
+                                    "Response Resource with no matching pending linkRequest id=\(orphanId.prefix(4).hexEncodedString)"
+                                )
+                            } else if let unpacked = LinkRequestCodec.unpackResponse(data),
+                                      let cont = pendingLinkRequests.removeValue(forKey: unpacked.requestId) {
                                 cont.resume(returning: unpacked.payload)
                             } else {
-                                cont.resume(returning: data)
+                                await incomingResourceCallback?(data, link)
                             }
-                        } else {
-                            await incomingResourceCallback?(data, link)
                         }
                         await link.removeResource(hash: await resource.hash, outgoing: false)
                     }
@@ -741,24 +746,26 @@ public actor Transport {
         timeout: TimeInterval = 120
     ) async throws -> Data {
         let plaintext = LinkRequestCodec.packRequest(path: path, payload: payload)
-        let requestId = CryptoEngine.truncatedHash(plaintext)
+        let encrypted = try await link.encrypt(plaintext)
+        let linkId = await link.linkId
+        let packet = Packet(
+            header: PacketHeader(
+                headerType: .type1,
+                propagationType: .broadcast,
+                destinationType: .link,
+                packetType: .data
+            ),
+            destinationHash: linkId,
+            context: .request,
+            data: encrypted
+        )
+        // Python RequestReceipt: request_id = packet_receipt.truncated_hash
+        // (`Packet.getTruncatedHash()`), not truncated_hash(plaintext).
+        let requestId = try packet.truncatedHash()
         return try await withCheckedThrowingContinuation { continuation in
             pendingLinkRequests[requestId] = continuation
             Task {
                 do {
-                    let encrypted = try await link.encrypt(plaintext)
-                    let linkId = await link.linkId
-                    let packet = Packet(
-                        header: PacketHeader(
-                            headerType: .type1,
-                            propagationType: .broadcast,
-                            destinationType: .link,
-                            packetType: .data
-                        ),
-                        destinationHash: linkId,
-                        context: .request,
-                        data: encrypted
-                    )
                     try await sendPacket(packet)
                 } catch {
                     if pendingLinkRequests.removeValue(forKey: requestId) != nil {
@@ -773,6 +780,23 @@ public actor Transport {
                 }
             }
         }
+    }
+
+    /// Resume a pending `linkRequest` from an assembled Resource when possible.
+    private func completePendingLinkRequestIfNeeded(
+        resourceData: Data,
+        responseRequestId: Data?
+    ) -> Bool {
+        if let requestId = responseRequestId,
+           let cont = pendingLinkRequests.removeValue(forKey: requestId) {
+            if let unpacked = LinkRequestCodec.unpackResponse(resourceData) {
+                cont.resume(returning: unpacked.payload)
+            } else {
+                cont.resume(returning: resourceData)
+            }
+            return true
+        }
+        return false
     }
 
     // MARK: - Resources

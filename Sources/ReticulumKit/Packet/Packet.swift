@@ -2,6 +2,7 @@
 // Packet.swift — Reticulum packet pack/unpack and validation
 
 import Foundation
+import CryptoKit
 
 /// A Reticulum network packet with header, addressing, context, and data payload.
 ///
@@ -145,51 +146,84 @@ public struct Packet: Sendable, Equatable {
 
     /// Compute the hashable part of a raw packet for link ID derivation.
     ///
-    /// Per Python RNS/Packet.py `get_hashable_part()`:
+    /// Per Python RNS/Packet.py `get_hashable_part()` for **link-request** packets,
+    /// plus signalling trim used when deriving link IDs:
     /// - Byte 0 is masked to lower 4 bits (removing IFAC flag and header type)
     /// - Byte 1 (hops) is skipped
     /// - For type2, the transport ID (16 bytes after flags+hops) is also skipped
     /// - If the data portion exceeds `LinkConstants.ecPubSize` (64 bytes),
     ///   the trailing signalling bytes are trimmed from the result
     ///
+    /// For delivery proofs and `Link.request` ids, use ``dataPacketHashablePart(raw:headerType:)``
+    /// / ``truncatedPacketHash(raw:headerType:)`` instead — those match Python's
+    /// untrimmed `get_hashable_part()`.
+    ///
     /// - Parameters:
     ///   - raw: Raw wire-format packet bytes.
     ///   - headerType: The header type of the packet.
     /// - Returns: The hashable bytes used for packet hash / link ID computation.
     public static func hashablePart(raw: Data, headerType: HeaderType) -> Data {
-        guard !raw.isEmpty else { return Data() }
+        var result = dataPacketHashablePart(raw: raw, headerType: headerType)
 
-        // Mask byte 0 to lower 4 bits
-        let maskedFlags = raw[raw.startIndex] & 0x0F
-
-        // Determine where to start copying after skipping flags+hops (and transport ID for type2)
-        let skipOffset: Int
+        // Check if data portion exceeds ecPubSize; if so, trim signalling bytes
         let headerSize: Int
         switch headerType {
         case .type1:
-            skipOffset = 2  // skip flags + hops
-            headerSize = 2 + ReticulumConstants.truncatedHashLength + 1  // flags + hops + destHash + context = 19
+            headerSize = 2 + ReticulumConstants.truncatedHashLength + 1
         case .type2:
-            skipOffset = 2 + ReticulumConstants.truncatedHashLength  // skip flags + hops + transport ID
-            headerSize = 2 + ReticulumConstants.truncatedHashLength + ReticulumConstants.truncatedHashLength + 1  // 35
+            headerSize = 2 + ReticulumConstants.truncatedHashLength + ReticulumConstants.truncatedHashLength + 1
+        }
+        let dataLength = raw.count - headerSize
+        if dataLength > LinkConstants.ecPubSize {
+            let excessBytes = dataLength - LinkConstants.ecPubSize
+            result = Data(result.prefix(result.count - excessBytes))
+        }
+
+        return result
+    }
+
+    /// Python `Packet.get_hashable_part()` without link-request signalling trim.
+    ///
+    /// Used for delivery proofs and `Link.request` / RESPONSE `request_id`
+    /// (`packet.getTruncatedHash()`).
+    public static func dataPacketHashablePart(raw: Data, headerType: HeaderType) -> Data {
+        guard !raw.isEmpty else { return Data() }
+
+        let maskedFlags = raw[raw.startIndex] & 0x0F
+        let skipOffset: Int
+        switch headerType {
+        case .type1:
+            skipOffset = 2
+        case .type2:
+            skipOffset = 2 + ReticulumConstants.truncatedHashLength
         }
 
         var result = Data([maskedFlags])
         if raw.count > skipOffset {
             result.append(raw.suffix(from: raw.startIndex + skipOffset))
         }
-
-        // Check if data portion exceeds ecPubSize; if so, trim signalling bytes
-        let dataLength = raw.count - headerSize
-        if dataLength > LinkConstants.ecPubSize {
-            let excessBytes = dataLength - LinkConstants.ecPubSize
-            result = result.prefix(result.count - excessBytes)
-        }
-
         return result
     }
 
+    /// Python `Packet.getTruncatedHash()` — first 16 bytes of SHA-256 over
+    /// ``dataPacketHashablePart(raw:headerType:)``.
+    public static func truncatedPacketHash(raw: Data, headerType: HeaderType) -> Data {
+        CryptoEngine.truncatedHash(dataPacketHashablePart(raw: raw, headerType: headerType))
+    }
+
+    /// Full SHA-256 of ``dataPacketHashablePart(raw:headerType:)`` (Python `Packet.get_hash()`).
+    public static func fullPacketHash(raw: Data, headerType: HeaderType) -> Data {
+        Data(SHA256.hash(data: dataPacketHashablePart(raw: raw, headerType: headerType)))
+    }
+
+    /// Truncated hash of this packet after packing (Python `getTruncatedHash()`).
+    public func truncatedHash() throws -> Data {
+        let raw = try pack()
+        return Self.truncatedPacketHash(raw: raw, headerType: header.headerType)
+    }
+
     /// Validate packet integrity.
+
     ///
     /// Checks header type consistency with transport ID presence and MTU compliance.
     /// - Throws: `ReticulumError` if validation fails.
